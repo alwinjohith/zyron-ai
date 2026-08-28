@@ -4,8 +4,11 @@ import fs from "fs";
 import type { MemoryCategory, RelevantMemory } from "@/types/memory";
 
 // Path to the SQLite database file
-// Stored in the project root so it persists between restarts
-const DB_PATH = path.join(process.cwd(), "data", "memory.db");
+// Stored in the project root so it persists between restarts.
+// Overridable via MEMORY_DB_PATH so tests can run against an isolated
+// database without touching production data.
+const DB_PATH =
+  process.env.MEMORY_DB_PATH || path.join(process.cwd(), "data", "memory.db");
 
 // Singleton database instance
 let db: Database.Database | null = null;

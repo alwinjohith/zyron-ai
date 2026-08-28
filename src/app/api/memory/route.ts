@@ -7,6 +7,7 @@ import {
   updateMemory,
   getMemoriesByCategory,
   categorizeMemory,
+  resolveMemoryConflict,
 } from "@/lib/db";
 
 /**
@@ -34,8 +35,9 @@ export async function GET(request: Request) {
 
 /**
  * POST /api/memory
- * Create a new memory.
+ * Create a new memory with conflict resolution.
  * Body: { content: string, category?: string }
+ * Returns: { success: true, memory, archived: number, action: "archived" | "created" }
  */
 export async function POST(request: Request) {
   try {
@@ -49,8 +51,26 @@ export async function POST(request: Request) {
       );
     }
 
-    const memory = createMemory(content.trim(), category || categorizeMemory(content));
-    return NextResponse.json({ success: true, memory }, { status: 201 });
+    const trimmedContent = content.trim();
+    const finalCategory = category || categorizeMemory(trimmedContent);
+
+    // Archive any active memory describing the same underlying fact, so only
+    // the newest value stays active. Unrelated memories are never touched.
+    const resolution = resolveMemoryConflict(trimmedContent, finalCategory);
+
+    // Store the newly stated value as the active memory.
+    const memory = createMemory(trimmedContent, finalCategory);
+
+    return NextResponse.json(
+      {
+        success: true,
+        memory,
+        archived:
+          resolution.action === "archived" ? resolution.archived.length : 0,
+        action: resolution.action === "archived" ? "archived" : "created",
+      },
+      { status: 201 }
+    );
   } catch (error) {
     console.error("Failed to create memory:", error);
     return NextResponse.json(
