@@ -1,0 +1,16 @@
+# Zyron AI Model Configuration
+# Based on qwen3:1.7b
+# This file documents the model configuration for reproducibility.
+# Model weights are NOT stored in this repository.
+
+FROM qwen3:1.7b
+
+# Model parameters (configured via API in src/app/api/chat/route.ts)
+# PARAMETER num_predict 256
+# PARAMETER temperature 0.3
+# PARAMETER top_p 0.9
+
+# System prompt is provided by the application at runtime
+# See src/app/api/chat/route.ts for SYSTEM_PROMPT
+
+# think: false is set via API to disable reasoning for fast CPU responses

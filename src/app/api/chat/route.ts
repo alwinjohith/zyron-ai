@@ -24,7 +24,7 @@ try {
 }
 
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
-const MODEL = "qwen3:1.7b";
+const MODEL = process.env.MODEL || "qwen3:1.7b";
 
 const SYSTEM_PROMPT = `You are Zyron, a friendly personal AI assistant. You help the user with their daily tasks, questions, and goals.
 
