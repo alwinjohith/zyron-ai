@@ -1222,21 +1222,26 @@ const RECENCY_BONUS_MAX = 1;
  * message, applying a safe SQL-level pre-filter instead of loading the whole
  * active table into JS.
  *
- * When the message has at least one "distinctive" topic token (a token that is
- * neither a stopword nor a generic topic word), we SELECT only memories whose
- * content contains at least one such token. Otherwise we fall back to loading
- * all active memories to preserve exact Stage 1-3 behavior (category and
- * fact-slot matches that do not rely on shared keywords).
+ * When the message (plus any `extraTokens`, e.g. a resolved follow-up topic)
+ * has at least one "distinctive" topic token (a token that is neither a
+ * stopword nor a generic topic word), we SELECT only memories whose content
+ * contains at least one such token. Otherwise we fall back to loading all
+ * active memories to preserve exact Stage 1-3 behavior (category and fact-slot
+ * matches that do not rely on shared keywords).
  *
  * All values are bound as parameters (never interpolated), so the LIKE filter
  * is safe against SQL injection.
  */
-function getActiveMemoryCandidates(message: string): MemoryRow[] {
+function getActiveMemoryCandidates(
+  message: string,
+  extraTokens: string[] = []
+): MemoryRow[] {
   const db = getDb();
 
-  const distinctive = extractTopicTokens(message).filter(
-    (t) => !GENERIC_TOPIC_WORDS.has(t)
-  );
+  const distinctive = [
+    ...extractTopicTokens(message).filter((t) => !GENERIC_TOPIC_WORDS.has(t)),
+    ...extraTokens.filter((t) => !GENERIC_TOPIC_WORDS.has(t)),
+  ].filter((t, i, arr) => arr.indexOf(t) === i);
 
   // No distinctive token: fall back to the full active set to preserve
   // category- and fact-slot-based matches from earlier stages.
@@ -1270,22 +1275,60 @@ function getActiveMemoryCandidates(message: string): MemoryRow[] {
  * Returns at most `limit` memories scoring above the threshold.
  * Unrelated memories score 0 and are excluded.
  * General knowledge questions and greetings return no memories.
+ *
+ * When `followUpTopic` is provided (a resolved prior topic from short-term
+ * context) and the message carries no topic entity of its own, the message is
+ * treated as a continuation: the follow-up topic is merged into entity/topic
+ * matching, category relevance, and candidate pre-filtering, and the message
+ * is allowed past the intent gate (instead of being dropped as "other").
  */
 export function getRelevantMemories(
   message: string,
   recentMessages: Array<{ role: string; content: string }> = [],
-  limit: number = MAX_RELEVANT_MEMORIES
+  limit: number = MAX_RELEVANT_MEMORIES,
+  followUpTopic?: string | null
 ): Array<RelevantMemory & MemoryRow> {
   // Analyze question context with conversation history
   const qctx = analyzeQuestionContext(message, recentMessages);
 
-  // Don't inject memories for general knowledge questions or greetings
-  if (!shouldInjectMemoriesForIntent(qctx.intent)) {
+  // Own entities = entities in the message itself, WITHOUT pronoun auto-
+  // resolution. This distinguishes "this message introduces its own topic"
+  // from "this message is just a reference to the prior topic".
+  const ownEntities = extractEntities(message);
+
+  // A genuine follow-up continues the conversation: the message carries no
+  // topic entity of its own, but a reliable prior topic was resolved. This is
+  // conservative — trivial filler and messages with their own topic entity are
+  // never treated as a follow-up.
+  const isFollowUp =
+    Boolean(followUpTopic) &&
+    ownEntities.length === 0 &&
+    !isTrivialMessage(message);
+
+  // Don't inject memories for general knowledge questions, greetings, or
+  // other non-personal messages — UNLESS this is a genuine follow-up, which
+  // should be allowed to retrieve against its resolved topic.
+  if (!isFollowUp && !shouldInjectMemoriesForIntent(qctx.intent)) {
     return [];
   }
 
-  const memories = getActiveMemoryCandidates(message);
+  const memories = getActiveMemoryCandidates(
+    message,
+    isFollowUp ? [followUpTopic!] : []
+  );
   if (memories.length === 0) return [];
+
+  if (isFollowUp) {
+    // Enrich the scoring context with the resolved topic so entity/topic
+    // matching and category relevance can use it.
+    if (!qctx.entities.includes(followUpTopic!)) {
+      qctx.entities.push(followUpTopic!);
+    }
+    const followCat = mapTopicToCategory(followUpTopic!);
+    if (followCat && !qctx.categories.includes(followCat)) {
+      qctx.categories.push(followCat);
+    }
+  }
 
   const newTokens = extractTopicTokens(message);
   const ctx = {
@@ -1332,4 +1375,120 @@ export function getMemoriesByCategory(category: string) {
     createdAt: string;
     updatedAt: string;
   }>;
+}
+
+// ============================================================
+// STAGE 5: SHORT-TERM CONVERSATION CONTEXT
+// ============================================================
+//
+// These helpers derive a lightweight, deterministic notion of the CURRENT
+// conversation (active topics, follow-ups, pronoun antecedents) so the prompt
+// can carry short-term continuity WITHOUT persisting anything to SQLite.
+// Long-term memory continues to use the existing Stage 1-4 system untouched.
+
+/**
+ * The derived short-term context for a single user message.
+ * This is ephemeral (per-request) and is NEVER written to the database.
+ */
+export interface ShortTermContext {
+  /** Topics carried over from the recent conversation (last few user turns). */
+  activeTopics: string[];
+  /** Likely pronoun antecedents, only when determinable with confidence. */
+  pronounHints: string[];
+  /** The most recent topic a follow-up message is attached to, if any. */
+  followUpTopic: string | null;
+  /** True when the message is conversational filler with no real topic. */
+  isTrivial: boolean;
+}
+
+// Pronouns that typically reference something stated earlier in the turn.
+const REFERENCING_PRONOUNS = [
+  "it", "that", "this", "they", "its", "them", "these", "those",
+];
+
+// Exact conversational-filler phrases treated as "trivial" (no memory scan).
+const TRIVIAL_PHRASES = new Set([
+  "hi", "hello", "hey", "heya", "hiya", "howdy", "yo",
+  "good morning", "good afternoon", "good evening",
+  "thanks", "thank you", "thx", "ty",
+  "ok", "okay", "k", "sure", "no problem", "cool", "nice", "great",
+  "how are you", "how are you doing", "how are you today", "how's it going",
+  "how have you been", "how are things", "what's up", "whats up", "sup",
+  "bye", "goodbye", "good night", "see you", "see ya", "later",
+  "yes", "yeah", "yep", "nope", "no",
+]);
+
+/**
+ * Conservative check for conversational filler that carries no topic.
+ * A message with any recognized entity or distinctive topic token is never
+ * trivial, so legitimate short questions are never skipped.
+ */
+export function isTrivialMessage(
+  message: string,
+  ownEntities: string[] = [],
+  ownDistinctive: string[] = []
+): boolean {
+  if (ownEntities.length > 0 || ownDistinctive.length > 0) return false;
+
+  const normalized = message
+    .toLowerCase()
+    .trim()
+    .replace(/[.,!?;]+$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (normalized.length === 0) return true;
+  if (TRIVIAL_PHRASES.has(normalized)) return true;
+
+  const words = normalized.split(" ");
+  return words.length <= 3 && words.every((w) => TRIVIAL_PHRASES.has(w));
+}
+
+/**
+ * Build the short-term conversation context for the current message.
+ *
+ * Deterministic, rule-based, never persisted. Resolves:
+ * - activeTopics: the ongoing topic(s) from recent user turns.
+ * - followUpTopic: when the current message has no topic of its own but the
+ *   conversation does, attach it to the most recent topic.
+ * - pronounHints: only when the message uses a referencing pronoun AND carries
+ *   no self-contained topic AND a recent topic exists (conservative).
+ * - isTrivial: conversational filler with no topic.
+ */
+export function buildShortTermContext(
+  message: string,
+  recentMessages: Array<{ role: string; content: string }> = []
+): ShortTermContext {
+  const recentTopics = extractRecentTopics(recentMessages);
+  const ownEntities = extractEntities(message);
+  const ownDistinctive = extractTopicTokens(message).filter(
+    (t) => !GENERIC_TOPIC_WORDS.has(t)
+  );
+
+  const isTrivial = isTrivialMessage(message, ownEntities, ownDistinctive);
+
+  const usesPronoun = REFERENCING_PRONOUNS.some((p) =>
+    new RegExp(`\\b${p}\\b`, "i").test(message)
+  );
+  // "Bare" = the message introduces no topic entities of its own (no language,
+  // proper noun, tech, or academic term). Ordinary words such as "sensor" or
+  // "better" are not topic entities, so a follow-up like "What sensor should I
+  // use?" is still recognized as continuing the recent topic.
+  const isBare = ownEntities.length === 0;
+
+  // Follow-up: bare message (pronoun or no own topic) that continues the
+  // conversation. Attach it to the most recent prior topic.
+  let followUpTopic: string | null = null;
+  if (!isTrivial && recentTopics.length > 0 && (usesPronoun || isBare)) {
+    followUpTopic = recentTopics[recentTopics.length - 1];
+  }
+
+  // Pronoun hints only with reasonable confidence: a referencing pronoun in a
+  // bare message, and a definite prior topic to point at.
+  const pronounHints: string[] = [];
+  if (usesPronoun && isBare && recentTopics.length > 0) {
+    pronounHints.push(...recentTopics);
+  }
+
+  return { activeTopics: recentTopics, pronounHints, followUpTopic, isTrivial };
 }

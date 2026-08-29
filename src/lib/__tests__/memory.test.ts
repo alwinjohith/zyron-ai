@@ -9,6 +9,8 @@ import {
   getDb,
   searchMemories,
   MAX_RELEVANT_MEMORIES,
+  buildShortTermContext,
+  isTrivialMessage,
   categorizeMemory,
   findDuplicateMemory,
 } from "@/lib/db";
@@ -236,5 +238,147 @@ describe("Stage 4: memory retrieval quality", () => {
     const texts = relevant.map((m) => m.content);
     expect(texts.some((c) => c.includes("Java"))).toBe(true);
     expect(texts.some((c) => c.includes("Python"))).toBe(false);
+  });
+});
+
+describe("Stage 5: short-term conversation context", () => {
+  it("A: follow-up retains the ESP32 car topic", () => {
+    const history = [
+      { role: "user", content: "I'm building a car using ESP32." },
+    ];
+    const ctx = buildShortTermContext("What sensor should I use?", history);
+
+    // The active topic must include the ESP32/car context so the follow-up
+    // continues the same thread.
+    expect(ctx.activeTopics.length).toBeGreaterThan(0);
+    expect(ctx.activeTopics.join(" ").toLowerCase()).toContain("esp32");
+    expect(ctx.followUpTopic).toContain("esp32");
+  });
+
+  it("B: pronoun 'it' resolves to Java as the likely antecedent", () => {
+    const history = [{ role: "user", content: "I prefer Java." }];
+    const ctx = buildShortTermContext("Why is it better?", history);
+
+    expect(ctx.pronounHints.length).toBeGreaterThan(0);
+    expect(ctx.pronounHints.join(" ").toLowerCase()).toContain("java");
+    expect(ctx.followUpTopic).toBeTruthy();
+  });
+
+  it("C: 'its memory system' continues the Zyron project context", () => {
+    const history = [{ role: "user", content: "Tell me about my Zyron project." }];
+    const ctx = buildShortTermContext("What about its memory system?", history);
+
+    expect(ctx.activeTopics.length).toBeGreaterThan(0);
+    // Zyron (as a proper noun) should be in the carried-over topics.
+    expect(ctx.activeTopics.join(" ").toLowerCase()).toContain("zyron");
+    expect(ctx.followUpTopic).toBeTruthy();
+  });
+
+  it("D: trivial chit-chat is flagged and needs no broad memory scan", () => {
+    // No prior topics: a trivial greeting must be marked trivial.
+    const ctx = buildShortTermContext("How are you?", []);
+    expect(ctx.isTrivial).toBe(true);
+    expect(ctx.activeTopics.length).toBe(0);
+
+    // The raw fast-path helper also flags common fillers.
+    expect(isTrivialMessage("Hello")).toBe(true);
+    expect(isTrivialMessage("Hi")).toBe(true);
+    expect(isTrivialMessage("How are you?")).toBe(true);
+    expect(isTrivialMessage("Thanks")).toBe(true);
+    expect(isTrivialMessage("Okay")).toBe(true);
+  });
+
+  it("D2: legitimate short questions are NOT treated as trivial", () => {
+    // A real question with a subject must not be skipped by the fast path.
+    expect(isTrivialMessage("What is my project status?")).toBe(false);
+    expect(isTrivialMessage("What sensor should I use?")).toBe(false);
+    expect(isTrivialMessage("Is Java better than Python?")).toBe(false);
+  });
+
+  it("E: ambiguous pronoun with no evidence assigns no aggressive topic", () => {
+    // No prior conversation => no antecedent, no follow-up target.
+    const ctx = buildShortTermContext("It is good.", []);
+    expect(ctx.pronounHints.length).toBe(0);
+    expect(ctx.followUpTopic).toBeNull();
+    expect(ctx.activeTopics.length).toBe(0);
+  });
+
+  it("F: trivial message still yields no memory retrieval", () => {
+    // Storing one relevant memory; a trivial greeting must not surface it.
+    createMemory("My favorite color is blue.", "preferences");
+    const relevant = getRelevantMemories("Hi");
+    expect(relevant.length).toBe(0);
+  });
+});
+
+describe("Stage 5: follow-up retrieval coupling", () => {
+  it("A: ESP32 car follow-up retrieves the relevant project memory", () => {
+    createMemory("I'm building a car using ESP32.", "projects");
+    const history = [{ role: "user", content: "I'm building a car using ESP32." }];
+
+    // The follow-up carries the resolved topic "esp32" and no topic of its own.
+    const relevant = getRelevantMemories(
+      "What sensor should I use?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      "esp32"
+    );
+    const texts = relevant.map((m) => m.content);
+    expect(texts.some((c) => c.toLowerCase().includes("esp32"))).toBe(true);
+  });
+
+  it("B: 'Why is it better?' retains Java context and retrieves it", () => {
+    createMemory("I prefer Java.", "preferences");
+    const history = [{ role: "user", content: "I prefer Java." }];
+
+    const ctx = buildShortTermContext("Why is it better?", history);
+    expect(ctx.followUpTopic).toBeTruthy();
+
+    const relevant = getRelevantMemories(
+      "Why is it better?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      ctx.followUpTopic
+    );
+    const texts = relevant.map((m) => m.content);
+    expect(texts.some((c) => c.toLowerCase().includes("java"))).toBe(true);
+  });
+
+  it("C: 'its memory system' retains the Zyron project context", () => {
+    createMemory("I am building the Zyron project.", "projects");
+    const history = [{ role: "user", content: "Tell me about my Zyron project." }];
+
+    const ctx = buildShortTermContext("What about its memory system?", history);
+    expect(ctx.followUpTopic).toBeTruthy();
+
+    const relevant = getRelevantMemories(
+      "What about its memory system?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      ctx.followUpTopic
+    );
+    const texts = relevant.map((m) => m.content);
+    expect(texts.some((c) => c.toLowerCase().includes("zyron"))).toBe(true);
+  });
+
+  it("D: 'How are you?' still avoids long-term memory retrieval", () => {
+    createMemory("My favorite color is blue.", "preferences");
+
+    const ctx = buildShortTermContext("How are you?", []);
+    const relevant = getRelevantMemories("How are you?");
+    expect(ctx.isTrivial).toBe(true);
+    expect(relevant.length).toBe(0);
+  });
+
+  it("E: 'It is good.' with no prior topic invents no antecedent and retrieves nothing", () => {
+    createMemory("My favorite color is blue.", "preferences");
+
+    const ctx = buildShortTermContext("It is good.", []);
+    expect(ctx.followUpTopic).toBeNull();
+    expect(ctx.pronounHints.length).toBe(0);
+
+    // No follow-up topic => the fallback path must not fabricate a match.
+    const relevant = getRelevantMemories("It is good.", []);
+    expect(relevant.length).toBe(0);
   });
 });

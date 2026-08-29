@@ -12,8 +12,11 @@ import {
   hasRemovalSignal,
   hasUpdateSignal,
   resolveMemoryConflict,
+  buildShortTermContext,
+  MAX_RELEVANT_MEMORIES,
 } from "@/lib/db";
 import type { RelevantMemory, RelevantMemoryContext } from "@/types/memory";
+import type { ShortTermContext } from "@/lib/db";
 
 // Fix categories for any existing memories on startup
 try {
@@ -208,6 +211,36 @@ function formatRelevantMemoryContext(memories: RelevantMemory[]): string {
   );
 }
 
+/**
+ * Build the short-term "Current conversation" prompt section from the derived
+ * context. Only useful conversational context is included (active topic,
+ * recent topics, conservative pronoun hints). It deliberately exposes NO
+ * database/memory internals — only ephemeral conversation facts.
+ * Returns an empty string when there is nothing useful to add.
+ */
+function formatShortTermContext(ctx: ShortTermContext): string {
+  const parts: string[] = [];
+
+  if (ctx.activeTopics.length > 0) {
+    parts.push(
+      `Current topics in this conversation: ${ctx.activeTopics.join(", ")}`
+    );
+  }
+
+  if (ctx.pronounHints.length > 0) {
+    parts.push(
+      `The user's references (it/that/this/its/them/etc.) most likely refer to the earlier topic: ${ctx.pronounHints.join(", ")}`
+    );
+  }
+
+  if (parts.length === 0) return "";
+  return (
+    "\n\nCurrent conversation context:\n" +
+    parts.join("\n") +
+    "\n(This is internal context to help you follow the conversation. Use it to interpret the latest message, but never mention it to the user.)"
+  );
+}
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -382,11 +415,20 @@ export async function POST(request: Request) {
       }
     }
 
-    // Retrieve only the memories relevant to the current user message.
-    // Unrelated memories are excluded so the model never sees the full table.
-    // Pass recent conversation history for context-aware relevance.
+    // --- Short-term (per-request) conversation context ---
+    // Derives the active topic and any pronoun/follow-up hints for the latest
+    // message. This is deterministic, rule-based, and never persisted.
     const recentMessages = messages.slice(-6); // last 6 messages for context
-    const relevantMemories = getRelevantMemories(userText, recentMessages);
+    const shortTerm = buildShortTermContext(userText, recentMessages);
+    const shortTermSection = formatShortTermContext(shortTerm);
+
+    // Retrieve only the memories relevant to the current user message.
+    // Trivial conversational filler ("hi", "how are you?", "okay") is skipped
+    // entirely so it never triggers a broad long-term memory scan.
+    // Unrelated memories are excluded so the model never sees the full table.
+    const relevantMemories = shortTerm.isTrivial
+      ? []
+      : getRelevantMemories(userText, recentMessages, MAX_RELEVANT_MEMORIES, shortTerm.followUpTopic);
     const memoryContext: RelevantMemoryContext = {
       query: userText,
       memories: relevantMemories,
@@ -399,7 +441,8 @@ export async function POST(request: Request) {
     const ollamaMessages = [
       {
         role: "system",
-        content: SYSTEM_PROMPT + memoryPromptSection,
+        content:
+          SYSTEM_PROMPT + memoryPromptSection + shortTermSection,
       },
       ...messages.map((m: { role: string; content: string }) => ({
         role: m.role,
