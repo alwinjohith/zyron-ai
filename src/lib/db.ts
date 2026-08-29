@@ -164,13 +164,19 @@ export function archiveMemory(id: number): boolean {
 /**
  * Search memories by content (simple text matching).
  * Used to find relevant memories for context injection.
+ * Only ACTIVE (non-archived) memories are returned, and results are limited
+ * to `limit` rows (default MAX_RELEVANT_MEMORIES). Archived memories are
+ * excluded so they never leak into retrieval.
  */
-export function searchMemories(query: string) {
+export function searchMemories(
+  query: string,
+  limit: number = MAX_RELEVANT_MEMORIES
+) {
   const db = getDb();
   const stmt = db.prepare(
-    "SELECT * FROM memories WHERE content LIKE ? ORDER BY createdAt DESC LIMIT 10"
+    "SELECT * FROM memories WHERE is_active = 1 AND content LIKE ? ORDER BY createdAt DESC LIMIT ?"
   );
-  return stmt.all(`%${query}%`) as Array<{
+  return stmt.all(`%${query}%`, limit) as Array<{
     id: number;
     content: string;
     category: string;
@@ -779,8 +785,10 @@ function mapIntentToCategories(
         categories.push("education");
       }
       if (categories.length === 0) {
-        // Default: all specific categories
-        categories.push("projects", "preferences", "education", "personal");
+        // No topical anchor: do NOT blanket-boost all categories. Without a
+        // category signal, retrieval relies on direct keyword/entity/fact-slot
+        // overlap only, so unrelated memories are far less likely to be
+        // injected. Fewer irrelevant memories reach the prompt.
       }
       break;
     case "general_knowledge":
@@ -962,11 +970,13 @@ export function computeEnhancedRelevanceScore(
 ): number {
   const memTokens = extractTopicTokens(memory.content);
 
-  // 1. Keyword/topic overlap (distinctive tokens only)
+  // 1. Keyword/topic overlap (distinctive tokens only).
+  //    Capped so many shared keywords cannot flood the score and outrank a
+  //    semantically exact fact-slot match from a shorter memory.
   const sharedDistinctive = memTokens.filter(
     (t) => newTokenSet.has(t) && !GENERIC_TOPIC_WORDS.has(t)
   );
-  let score = sharedDistinctive.length * 2;
+  let score = Math.min(sharedDistinctive.length, 3) * 2;
 
   // 2. Language preference bonus
   const memLangs = memTokens.filter((t) => LANGUAGES.has(t));
@@ -980,20 +990,22 @@ export function computeEnhancedRelevanceScore(
   // 4. Fact slot match bonus (semantic matching)
   score += scoreFactSlotMatch(memory, qctx);
 
-  // 5. Entity overlap bonus (direct entity matching)
+  // 5. Entity overlap bonus (direct entity matching), capped to avoid flooding
   const memEntities = extractEntities(memory.content);
+  let entityScore = 0;
   for (const entity of qctx.entities) {
     if (memEntities.includes(entity)) {
-      score += 3; // Strong boost for exact entity match
+      entityScore += 3; // Strong boost for exact entity match
     } else {
       // Partial entity match
       for (const memEntity of memEntities) {
         if (memEntity.includes(entity) || entity.includes(memEntity)) {
-          score += 1;
+          entityScore += 1;
         }
       }
     }
   }
+  score += Math.min(entityScore, 9);
 
   // 6. Recency bonus for conversation continuity (memories matching recent topics)
   for (const topic of qctx.recentTopics) {
@@ -1008,7 +1020,30 @@ export function computeEnhancedRelevanceScore(
     score = Math.max(1, score - 2);
   }
 
-  return score;
+  // 8. Recency-aware boost: newer memories are more likely the current truth,
+  //    so fresher facts are preferred over stale-but-active ones. Bounded so
+  //    it never overrides a strong semantic match.
+  score += computeRecencyBonus(memory.updatedAt);
+
+  // 9. Hard cap to keep scores bounded and stable against keyword flooding.
+  return Math.min(score, MAX_RELEVANCE_SCORE);
+}
+
+/**
+ * Compute a small recency bonus from a memory's updatedAt timestamp.
+ * Recent memories earn a larger bonus; very old memories earn none.
+ * The bonus is bounded (0..RECENCY_BONUS_MAX) so it never overrides a
+ * strong keyword/fact-slot match, only breaks ties directionally.
+ */
+function computeRecencyBonus(updatedAt: string): number {
+  const time = Date.parse(updatedAt);
+  if (Number.isNaN(time)) return 0;
+
+  const ageDays = (Date.now() - time) / (24 * 60 * 60 * 1000);
+  if (ageDays <= 1) return RECENCY_BONUS_MAX;          // today
+  if (ageDays <= 7) return 1;                           // this week
+  if (ageDays <= 30) return 0;                          // recently but not enough
+  return 0;
 }
 
 /**
@@ -1173,7 +1208,52 @@ export const MAX_RELEVANT_MEMORIES = 3;
 // Minimum combined relevance score for a memory to be injected.
 const RELEVANCE_THRESHOLD = 2;
 
+// Hard cap on the combined relevance score so keyword/token flooding cannot
+// dominate and produce unbounded, unstable rankings.
+const MAX_RELEVANCE_SCORE = 15;
+
+// Maximum recency bonus awarded to a memory updated within the last day.
+const RECENCY_BONUS_MAX = 1;
+
 // Category relevance is now handled by scoreCategoryRelevance in computeEnhancedRelevanceScore
+
+/**
+ * Fetch the ACTIVE memories that are plausible candidates for the given
+ * message, applying a safe SQL-level pre-filter instead of loading the whole
+ * active table into JS.
+ *
+ * When the message has at least one "distinctive" topic token (a token that is
+ * neither a stopword nor a generic topic word), we SELECT only memories whose
+ * content contains at least one such token. Otherwise we fall back to loading
+ * all active memories to preserve exact Stage 1-3 behavior (category and
+ * fact-slot matches that do not rely on shared keywords).
+ *
+ * All values are bound as parameters (never interpolated), so the LIKE filter
+ * is safe against SQL injection.
+ */
+function getActiveMemoryCandidates(message: string): MemoryRow[] {
+  const db = getDb();
+
+  const distinctive = extractTopicTokens(message).filter(
+    (t) => !GENERIC_TOPIC_WORDS.has(t)
+  );
+
+  // No distinctive token: fall back to the full active set to preserve
+  // category- and fact-slot-based matches from earlier stages.
+  if (distinctive.length === 0) {
+    return db
+      .prepare("SELECT * FROM memories WHERE is_active = 1 ORDER BY createdAt DESC")
+      .all() as MemoryRow[];
+  }
+
+  const clauses = distinctive.map(() => "content LIKE ?");
+  const where = `is_active = 1 AND (${clauses.join(" OR ")})`;
+  const params = distinctive.map((t) => `%${t}%`);
+  const stmt = db.prepare(
+    `SELECT * FROM memories WHERE ${where} ORDER BY createdAt DESC`
+  );
+  return stmt.all(...params) as MemoryRow[];
+}
 
 /**
  * Retrieve memories relevant to the current user message.
@@ -1204,7 +1284,7 @@ export function getRelevantMemories(
     return [];
   }
 
-  const memories = getAllMemories() as MemoryRow[];
+  const memories = getActiveMemoryCandidates(message);
   if (memories.length === 0) return [];
 
   const newTokens = extractTopicTokens(message);
