@@ -21,11 +21,21 @@ import {
   extractProjectName,
   getActiveProjectContext,
   clearAllProjectContext,
+  detectTaskStatement,
+  createTaskContext,
+  getActiveTaskContext,
+  getRecentTasks,
+  markActiveTaskInProgress,
+  completeActiveTask,
+  buildTaskContext,
+  taskTitlesMatch,
+  clearAllTaskContext,
 } from "@/lib/db";
 
 beforeEach(() => {
   clearAllMemories();
   clearAllProjectContext();
+  clearAllTaskContext();
 });
 
 describe("Stage 3: memory conflict / update resolution", () => {
@@ -582,5 +592,270 @@ describe("Stage 7: project & goal awareness", () => {
     const project = createProjectContext("ESP32 car", "I'm building an ESP32 car.");
     expect(project).toBeTruthy();
     expect(getAllMemories().length).toBe(0);
+  });
+});
+
+describe("Stage 8: planning & task awareness", () => {
+  it("A: detects and creates an active task from a first-person commitment", () => {
+    const stmt = detectTaskStatement("I need to connect the motor driver.");
+    expect(stmt.kind).toBe("create");
+    expect(stmt.title).toBe("Connect the motor driver");
+
+    createTaskContext(stmt.title!);
+    const active = getActiveTaskContext();
+    expect(active?.title).toBe("Connect the motor driver");
+    expect(active?.status).toBe("planned");
+    expect(active?.is_active).toBe(1);
+  });
+
+  it("B: detects multiple create phrasings", () => {
+    expect(detectTaskStatement("I have to solder the pins.").kind).toBe("create");
+    expect(detectTaskStatement("My next step is to flash the firmware.").kind).toBe("create");
+    expect(detectTaskStatement("Next I'll wire the power supply.").kind).toBe("create");
+    expect(detectTaskStatement("I'm going to mount the board.").kind).toBe("create");
+  });
+
+  it("C: does not create tasks from questions, help requests, or fillers", () => {
+    expect(detectTaskStatement("What's the weather?")).toEqual({
+      kind: "question",
+      title: null,
+    });
+    expect(detectTaskStatement("I need help with the code.").kind).toBe("none");
+    expect(detectTaskStatement("I have to go now.").kind).toBe("none");
+    expect(detectTaskStatement("I like pizza.").kind).toBe("none");
+    expect(detectTaskStatement("I'm stuck.").kind).toBe("none");
+    expect(detectTaskStatement("Hello!").kind).toBe("none");
+    expect(detectTaskStatement("Can you help me?").kind).toBe("none");
+  });
+
+  it("D: a task snapshots the active project name as project_ref", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+
+    const task = createTaskContext("Connect the motor driver");
+    expect(task.project_ref).toBe("ESP32 car");
+    expect(getActiveTaskContext()?.project_ref).toBe("ESP32 car");
+  });
+
+  it("E: only one task is active at a time (new task supersedes old)", () => {
+    createTaskContext("Connect the motor driver");
+    createTaskContext("Solder the pins");
+
+    const active = getActiveTaskContext();
+    expect(active?.title).toBe("Solder the pins");
+
+    const db = getDb();
+    const all = db
+      .prepare("SELECT * FROM task_context ORDER BY id")
+      .all() as Array<{ is_active: number }>;
+    // Both rows still exist; only the newest is active.
+    expect(all.filter((r) => r.is_active === 1)).toHaveLength(1);
+    expect(all).toHaveLength(2);
+  });
+
+  it("F: progress that matches the active task updates it in place", () => {
+    createTaskContext("Connect the motor driver");
+
+    const stmt = detectTaskStatement("I'm working on the motor driver now.");
+    expect(stmt.kind).toBe("progress");
+
+    markActiveTaskInProgress();
+    expect(getActiveTaskContext()?.status).toBe("in_progress");
+
+    const db = getDb();
+    const count = db.prepare("SELECT COUNT(*) AS c FROM task_context").get() as {
+      c: number;
+    };
+    expect(count.c).toBe(1); // no new row was created
+  });
+
+  it("G: progress with a clearly different object starts a new in_progress task", () => {
+    createTaskContext("Connect the motor driver");
+
+    const stmt = detectTaskStatement("I'm working on the display panel.");
+    expect(stmt.kind).toBe("create");
+    expect(stmt.status).toBe("in_progress");
+
+    createTaskContext(stmt.title!, "in_progress");
+    expect(getActiveTaskContext()?.title).toBe("Display panel");
+    expect(getActiveTaskContext()?.status).toBe("in_progress");
+  });
+
+  it("H: completing a matching task archives it", () => {
+    createTaskContext("Build the sensor circuit");
+
+    expect(detectTaskStatement("I finished the sensor circuit.").kind).toBe("done");
+    completeActiveTask();
+
+    expect(getActiveTaskContext()).toBeNull();
+
+    const db = getDb();
+    const row = db
+      .prepare("SELECT * FROM task_context WHERE title = 'Build the sensor circuit'")
+      .get() as { status: string; is_active: number };
+    expect(row.status).toBe("done");
+    expect(row.is_active).toBe(0);
+  });
+
+  it("I: anaphoric completion ('I finished it.') completes the active task", () => {
+    createTaskContext("Connect the motor driver");
+    expect(detectTaskStatement("I finished it.").kind).toBe("done");
+  });
+
+  it("J: a done statement about an unrelated object is a no-op", () => {
+    createTaskContext("Connect the motor driver");
+
+    expect(detectTaskStatement("I finished the oven.").kind).toBe("none");
+
+    // The active task is untouched.
+    expect(getActiveTaskContext()?.title).toBe("Connect the motor driver");
+  });
+
+  it("K: completion without a matching task is a no-op", () => {
+    expect(detectTaskStatement("I finished it.").kind).toBe("none");
+    completeActiveTask();
+    expect(getActiveTaskContext()).toBeNull();
+  });
+
+  it("L: 'What's next?' surfaces the active task but persists nothing", () => {
+    createTaskContext("Connect the motor driver");
+
+    const ctx = buildTaskContext("What's next?", [], false);
+    expect(ctx.isTaskRelated).toBe(true);
+    expect(ctx.section).toContain("Connect the motor driver");
+    expect(ctx.section).toContain("planned");
+
+    const db = getDb();
+    const count = db.prepare("SELECT COUNT(*) AS c FROM task_context").get() as {
+      c: number;
+    };
+    expect(count.c).toBe(1);
+  });
+
+  it("M: 'What have I done?' lists recent tasks without persisting", () => {
+    createTaskContext("Connect the motor driver");
+    completeActiveTask();
+
+    const ctx = buildTaskContext("What have I done?", [], false);
+    expect(ctx.isTaskRelated).toBe(true);
+    expect(ctx.section).toContain("Connect the motor driver");
+    expect(ctx.section).toContain("(done)");
+
+    const db = getDb();
+    const count = db.prepare("SELECT COUNT(*) AS c FROM task_context").get() as {
+      c: number;
+    };
+    expect(count.c).toBe(1);
+  });
+
+  it("N: 'What's next?' without an active task does not fabricate a section", () => {
+    const ctx = buildTaskContext("What's next?", [], false);
+    expect(ctx.isTaskRelated).toBe(false);
+    expect(ctx.section).toBe("");
+  });
+
+  it("O: an anaphoric question is a task follow-up", () => {
+    createTaskContext("Connect the motor driver");
+
+    const ctx = buildTaskContext("Does it need a capacitor?", [], false);
+    expect(ctx.isTaskRelated).toBe(true);
+    expect(ctx.section).toContain("Connect the motor driver");
+  });
+
+  it("P: unrelated general-knowledge questions are NOT task follow-ups", () => {
+    createTaskContext("Connect the motor driver");
+
+    const ctx = buildTaskContext("What's the weather today?", ["esp32", "car"], false);
+    expect(ctx.isTaskRelated).toBe(false);
+    expect(ctx.section).toBe("");
+  });
+
+  it("Q: unrelated messages never attach to the task", () => {
+    createTaskContext("Connect the motor driver");
+
+    expect(detectTaskStatement("I like pizza.").kind).toBe("none");
+
+    const ctx = buildTaskContext("The weather forecast looks nice.", ["esp32"], false);
+    expect(ctx.isTaskRelated).toBe(false);
+
+    const db = getDb();
+    const count = db.prepare("SELECT COUNT(*) AS c FROM task_context").get() as {
+      c: number;
+    };
+    expect(count.c).toBe(1);
+  });
+
+  it("R: sequential tasks keep history and a single active task", () => {
+    createTaskContext("Connect the motor driver");
+    createTaskContext("Solder the pins");
+    completeActiveTask();
+
+    expect(getActiveTaskContext()).toBeNull();
+    const recent = getRecentTasks(3);
+    expect(recent.map((t) => t.title)).toEqual([
+      "Solder the pins",
+      "Connect the motor driver",
+    ]);
+  });
+
+  it("S: task tracking does not create or interfere with memories", () => {
+    createTaskContext("Connect the motor driver");
+    expect(getAllMemories().length).toBe(0);
+
+    createMemory("My favorite color is green.", "preferences");
+    expect(getAllMemories().length).toBe(1);
+
+    const relevant = getRelevantMemories("What is my favorite color?");
+    expect(relevant.map((m) => m.content).some((c) => c.includes("green"))).toBe(true);
+  });
+
+  it("T: task rows never appear in memory retrieval/listings", () => {
+    createTaskContext("Connect the motor driver");
+    expect(getAllMemories().length).toBe(0);
+    expect(getAllMemoriesIncludingArchived().length).toBe(0);
+    expect(getRelevantMemories("motor driver").length).toBe(0);
+  });
+
+  it("U: task statements do not change project context", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+
+    createTaskContext("Connect the motor driver");
+    expect(getActiveProjectContext()?.name).toBe("ESP32 car");
+  });
+
+  it("V: project context is untouched when a task is completed", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+
+    createTaskContext("Connect the motor driver");
+    completeActiveTask();
+
+    expect(getActiveProjectContext()?.name).toBe("ESP32 car");
+  });
+
+  it("W: taskTitlesMatch distinguishes close and unrelated tasks", () => {
+    expect(taskTitlesMatch("Connect the motor driver", "the motor driver")).toBe(true);
+    expect(taskTitlesMatch("Connect the motor driver", "Write the ADC code")).toBe(false);
+  });
+
+  it("X: conflict resolution still archives conflicting memories when a task exists", () => {
+    createTaskContext("Connect the motor driver");
+    createMemory("My favorite programming language is Python.", "preferences");
+
+    const resolution = resolveMemoryConflict(
+      "Actually, my favorite programming language is Java.",
+      "preferences"
+    );
+    createMemory("Actually, my favorite programming language is Java.", "preferences");
+    expect(resolution.action).toBe("archived");
+
+    const active = getAllMemories().map((m) => m.content);
+    expect(active.some((c) => c.includes("Java"))).toBe(true);
+  });
+
+  it("Y: a task statement in the same turn surfaces as task context", () => {
+    createTaskContext("Connect the motor driver");
+
+    const ctx = buildTaskContext("I'm working on it.", [], false);
+    expect(ctx.isTaskRelated).toBe(true);
+    expect(ctx.section).toContain("Connect the motor driver");
   });
 });

@@ -71,6 +71,23 @@ export function getDb(): Database.Database {
     )
   `);
 
+  // Stage 8: lightweight active task context (additive, no migration).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS task_context (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'planned'
+        CHECK (status IN ('planned','in_progress','done')),
+      project_ref TEXT NOT NULL DEFAULT '',
+      is_active INTEGER NOT NULL DEFAULT 1,
+      createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+      updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_task_context_active ON task_context (is_active, updatedAt)"
+  );
+
   return db;
 }
 
@@ -1841,4 +1858,467 @@ export function buildProjectContext(
 export function clearAllProjectContext(): number {
   const db = getDb();
   return db.prepare("DELETE FROM project_context").run().changes;
+}
+
+// ============================================================
+// STAGE 8: PLANNING & TASK AWARENESS
+// ============================================================
+//
+// Lightweight, persistent tracking of the user's current task or plan step.
+// Separate from long-term memories and from project context — updates here do
+// NOT create memory rows, and the task_context table is purely additive. All
+// detection is deterministic and rule-based (no additional LLM calls).
+
+/** The lifecycle state of a tracked task. */
+export type TaskStatus = "planned" | "in_progress" | "done";
+
+interface TaskContextRow {
+  id: number;
+  title: string;
+  status: TaskStatus;
+  project_ref: string;
+  is_active: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Kinds of explicit task-related questions recognized deterministically. */
+export type TaskQuestionKind = "next" | "doneHistory" | "taskDetail";
+
+/**
+ * Result of deterministic task-statement detection on a user message.
+ * `kind` tells the caller what to persist:
+ * - "create": a new active task should be created (status may be "in_progress").
+ * - "progress": the active task should be marked in progress.
+ * - "done": the active task should be completed/archived.
+ * - "question": never persisted; may drive prompt injection via qtype.
+ * - "none": not a task, nothing to do.
+ */
+export interface TaskStatement {
+  kind: "create" | "progress" | "done" | "question" | "none";
+  title: string | null;
+  status?: "planned" | "in_progress";
+  qtype?: TaskQuestionKind;
+}
+
+// Everyday verbs that would turn "I need to go now." into noise instead of a
+// tracked task. A candidate title whose significant tokens are ALL fillers is
+// not a task.
+const TASK_FILLER_VERBS = new Set([
+  "go", "leave", "run", "sleep", "eat", "dinner", "lunch", "break", "rest",
+  "shower", "nap", "bathroom", "toilet",
+]);
+
+// First-person commitments to a future action.
+const TASK_CREATE_PATTERNS: RegExp[] = [
+  /\bi\s+need\s+(?:to\s+|a\s+|an\s+|the\s+|some\s+)?(.+)/i,
+  /\bi\s+(?:have|got)\s+to\s+(.+)/i,
+  /\bi\s+want\s+to\s+(.+)/i,
+  /\bi\s+plan\s+to\s+(.+)/i,
+  /\bi\s+intend\s+to\s+(.+)/i,
+  /\bi'?m\s+about\s+to\s+(.+)/i,
+  /\bi'?m\s+going\s+to\s+(.+)/i,
+  /\bi'?m\s+gonna\s+(.+)/i,
+  /\bmy\s+next\s+step\s+is\s+(?:to\s+)?(.+)/i,
+  /\bnext\s+(?:i'?ll|i\s+will)\s+(.+)/i,
+];
+
+// Phrases describing ongoing/in-progress work.
+const TASK_PROGRESS_PATTERNS: RegExp[] = [
+  /\bi'?m\s+currently\s+working\s+on\s+(.+)/i,
+  /\bi'?m\s+still\s+working\s+on\s+(.+)/i,
+  /\bi'?m\s+working\s+on\s+(.+)/i,
+  /\bi'?m\s+trying\s+to\s+(.+)/i,
+  /\bi'?m\s+stuck\s+(?:on|with)\s+(.+)/i,
+  /\bi'?m\s+continuing\s+(?:with\s+)?(.+)/i,
+  /\bi'?m\s+still\s+on\s+(.+)/i,
+];
+
+// Phrases declaring a completed action.
+const TASK_DONE_PATTERNS: RegExp[] = [
+  /\bi\s+finished\s+(.+)/i,
+  /\bi'?ve\s+finished\s+(.+)/i,
+  /\bi\s+completed\s+(.+)/i,
+  /\bi'?ve\s+completed\s+(.+)/i,
+  /\bi'?m\s+done\s+with\s+(.+)/i,
+  /\bi\s+got\s+(?:the\s+)?(.+)\s+working\b/i,
+  /\bi\s+fixed\s+(.+)/i,
+];
+
+// Explicit "what should I do next?" style questions.
+const TASK_NEXT_QUESTION_PATTERNS: RegExp[] = [
+  /\bwhat'?s\s+next\b/i,
+  /\bwhat\s+next\b/i,
+  /\bwhat\s+should\s+i\s+do\s+(?:next|now)\b/i,
+  /\bwhat'?s\s+the\s+next\s+(?:step|thing|task)\b/i,
+  /\bnow\s+what\b/i,
+];
+
+// Explicit "what have I done?" style questions.
+const TASK_DONE_HISTORY_PATTERNS: RegExp[] = [
+  /\bwhat\s+(?:have|did|do)\s+i\s+(?:done|do|finish(?:ed)?|complete(?:d)?|accomplish(?:ed)?)\b/i,
+  /\bwhat\s+have\s+i\s+(?:got|gotten)\s+done\b/i,
+];
+
+/**
+ * Normalize a raw task phrase for storage/display: strip surrounding
+ * punctuation, collapse whitespace, drop leading articles, capitalize.
+ */
+function normalizeTaskTitle(raw: string): string {
+  let title = raw
+    .trim()
+    .replace(/[.!?;:]+$/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^(?:the|a|an|my)\s+/i, "")
+    .trim();
+  if (title.length > 0) {
+    title = title.charAt(0).toUpperCase() + title.slice(1);
+  }
+  return title;
+}
+
+/**
+ * Significant (non-stopword) tokens of a task title, used for matching.
+ */
+function significantTaskTokens(title: string): string[] {
+  return extractTopicTokens(title);
+}
+
+/**
+ * Deterministically decide whether two task titles describe the same work.
+ * True when their significant-token sets are equal, or one is a subset of the
+ * other, or they share at least two significant tokens. This prevents a "done"
+ * statement about an unrelated object from hijacking the active task.
+ */
+export function taskTitlesMatch(aTitle: string, bTitle: string): boolean {
+  const aTokens = significantTaskTokens(aTitle);
+  const bTokens = significantTaskTokens(bTitle);
+  if (aTokens.length === 0 || bTokens.length === 0) return false;
+  const a = new Set(aTokens);
+  const b = new Set(bTokens);
+  const intersection = aTokens.filter((t) => b.has(t)).length;
+  if (intersection === Math.min(a.size, b.size)) return true; // equal or subset
+  return intersection >= 2;
+}
+
+/**
+ * Return the object phrase captured by the first matching pattern.
+ */
+function matchTaskPattern(message: string, patterns: RegExp[]): string | null {
+  for (const pattern of patterns) {
+    const m = message.match(pattern);
+    if (m) {
+      const phrase = m[1]?.trim();
+      if (phrase && phrase.length > 0) return phrase;
+    }
+  }
+  return null;
+}
+
+/**
+ * Deterministically detect whether a user message is about a task.
+ * Never persists anything itself — it only classifies. Questions (including
+ * "What's next?" and "What have I done?") are classified as "question" and are
+ * never persisted as tasks. "done"/"progress" are only returned when they
+ * actually apply to the current active task (or are anaphoric to it), so an
+ * unrelated statement can never hijack the active task.
+ */
+export function detectTaskStatement(message: string): TaskStatement {
+  const trimmed = message.trim();
+  if (!trimmed) return { kind: "none", title: null };
+
+  const lower = trimmed.toLowerCase();
+
+  // Greetings and trivial chit-chat are never tasks.
+  const intent = classifyUserIntent(trimmed);
+  if (intent === "greeting") return { kind: "none", title: null };
+
+  // Requests for assistance and commands to the assistant are not tasks.
+  // Checked before question classification so "Can you help me?"-style asks
+  // are never treated as task questions.
+  if (/\bhelp\b/.test(lower)) return { kind: "none", title: null };
+  if (
+    /^(?:can you|could you|please|tell me|show me|give me|let me)\b/.test(lower)
+  ) {
+    return { kind: "none", title: null };
+  }
+
+  // Questions are never persisted as tasks. Recognized explicitly so the
+  // prompt builder can inject the right context deterministically.
+  const isQuestion =
+    /[?]\s*$/.test(trimmed) ||
+    /^(what|which|who|whom|whose|when|where|why|how|does|do|is|are|can|could|should|would|did|will)\b/.test(
+      lower
+    );
+  if (isQuestion) {
+    if (TASK_NEXT_QUESTION_PATTERNS.some((re) => re.test(lower))) {
+      return { kind: "question", title: null, qtype: "next" };
+    }
+    if (TASK_DONE_HISTORY_PATTERNS.some((re) => re.test(lower))) {
+      return { kind: "question", title: null, qtype: "doneHistory" };
+    }
+    return { kind: "question", title: null };
+  }
+
+  // Guard against short fragments and vague chatter.
+  if (trimmed.length < 8) return { kind: "none", title: null };
+
+  const activeTask = getActiveTaskContext();
+
+  // "done" only applies when it matches the active task (or is anaphoric to it).
+  const donePhrase = matchTaskPattern(trimmed, TASK_DONE_PATTERNS);
+  if (donePhrase) {
+    const candidate = normalizeTaskTitle(donePhrase);
+    if (candidate.length === 0) return { kind: "none", title: null };
+    const tokens = significantTaskTokens(candidate);
+    if (
+      activeTask !== null &&
+      (tokens.length === 0 || taskTitlesMatch(candidate, activeTask.title))
+    ) {
+      return { kind: "done", title: null };
+    }
+    return { kind: "none", title: null };
+  }
+
+  // "progress" marks the active task in progress, or starts a new task when the
+  // object is clearly different and self-contained.
+  const progressPhrase = matchTaskPattern(trimmed, TASK_PROGRESS_PATTERNS);
+  if (progressPhrase) {
+    const candidate = normalizeTaskTitle(progressPhrase);
+    const tokens = significantTaskTokens(candidate);
+    if (
+      activeTask !== null &&
+      (tokens.length === 0 || taskTitlesMatch(candidate, activeTask.title))
+    ) {
+      return { kind: "progress", title: null };
+    }
+    if (tokens.length > 0 && !tokens.every((t) => TASK_FILLER_VERBS.has(t))) {
+      return { kind: "create", title: candidate, status: "in_progress" };
+    }
+    return { kind: "none", title: null };
+  }
+
+  // "create" commits to a future action; filter out filler endings.
+  const createPhrase = matchTaskPattern(trimmed, TASK_CREATE_PATTERNS);
+  if (createPhrase) {
+    const candidate = normalizeTaskTitle(createPhrase);
+    const tokens = significantTaskTokens(candidate);
+    if (tokens.length === 0 || tokens.every((t) => TASK_FILLER_VERBS.has(t))) {
+      return { kind: "none", title: null };
+    }
+    return { kind: "create", title: candidate };
+  }
+
+  return { kind: "none", title: null };
+}
+
+/**
+ * Create a new active task, deactivating any previously active task (only one
+ * current task at a time). Snapshots the active project's name into project_ref
+ * for lightweight traceability. Does NOT create a memory row.
+ */
+export function createTaskContext(
+  title: string,
+  status: TaskStatus = "planned"
+): TaskContextRow {
+  const db = getDb();
+  db.prepare("UPDATE task_context SET is_active = 0 WHERE is_active = 1").run();
+  const activeProject = getActiveProjectContext();
+  const result = db
+    .prepare(
+      "INSERT INTO task_context (title, status, project_ref) VALUES (?, ?, ?)"
+    )
+    .run(title, status, activeProject?.name ?? "");
+  return {
+    id: Number(result.lastInsertRowid),
+    title,
+    status,
+    project_ref: activeProject?.name ?? "",
+    is_active: 1,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Get the most recently updated active task. Returns null when there is no
+ * current task being tracked.
+ */
+export function getActiveTaskContext(): TaskContextRow | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      "SELECT * FROM task_context WHERE is_active = 1 ORDER BY updatedAt DESC, id DESC LIMIT 1"
+    )
+    .get() as TaskContextRow | undefined;
+  return row ?? null;
+}
+
+/**
+ * Get the most recently updated tasks (any status, including completed) for
+ * "what have I done?" style questions. Capped at the given limit.
+ */
+export function getRecentTasks(limit: number = 3): TaskContextRow[] {
+  const db = getDb();
+  const safeLimit = Math.max(1, Math.min(limit, 10));
+  return db
+    .prepare(
+      "SELECT * FROM task_context ORDER BY updatedAt DESC, id DESC LIMIT ?"
+    )
+    .all(safeLimit) as TaskContextRow[];
+}
+
+/**
+ * Mark the current task as in progress. No-op when no task is active.
+ */
+export function markActiveTaskInProgress(): TaskContextRow | null {
+  const active = getActiveTaskContext();
+  if (!active) return null;
+  const db = getDb();
+  db.prepare(
+    "UPDATE task_context SET status = 'in_progress', updatedAt = datetime('now') WHERE id = ?"
+  ).run(active.id);
+  return { ...active, status: "in_progress", updatedAt: new Date().toISOString() };
+}
+
+/**
+ * Complete (archive) the current task. No-op when no task is active.
+ */
+export function completeActiveTask(): TaskContextRow | null {
+  const active = getActiveTaskContext();
+  if (!active) return null;
+  const db = getDb();
+  db.prepare(
+    "UPDATE task_context SET status = 'done', is_active = 0, updatedAt = datetime('now') WHERE id = ?"
+  ).run(active.id);
+  return { ...active, status: "done", is_active: 0, updatedAt: new Date().toISOString() };
+}
+
+/**
+ * Format the current-task prompt section.
+ */
+function formatCurrentTask(task: TaskContextRow): string {
+  return (
+    "\n\nTask context:\n" +
+    `- Current task: ${task.title}\n` +
+    `- Status: ${task.status}` +
+    "\n(This is internal context about the user's current task. Use it to answer task-related follow-ups and questions like \"What's next?\". Do not mention this context to the user unless they ask about their task.)"
+  );
+}
+
+/**
+ * Format recent-task history for "what have I done?" style questions.
+ */
+function formatRecentTasks(tasks: TaskContextRow[]): string {
+  return (
+    "\n\nTask context:\n" +
+    tasks.map((t) => `- ${t.title} (${t.status})`).join("\n") +
+    "\n(These are the user's recent tasks. Use them to answer questions about what has been done. Do not mention this context to the user unless they ask about their tasks.)"
+  );
+}
+
+/**
+ * Deterministically decide whether a message is a follow-up to the current
+ * task. Conservative: requires a question (or pronoun ambiguity) that is not
+ * general knowledge or trivial, with some evidence tying it to the active task.
+ */
+function isTaskFollowUp(
+  message: string,
+  ownEntities: string[],
+  recentTopics: string[],
+  isTrivial: boolean,
+  activeTask: TaskContextRow
+): boolean {
+  if (isTrivial) return false;
+
+  const intent = classifyUserIntent(message);
+  if (intent === "general_knowledge" || intent === "greeting") return false;
+
+  const lower = message.toLowerCase().trim();
+  const isQuestion =
+    lower.endsWith("?") ||
+    /^(does|is|are|can|could|should|would|did|do|what|which|how|why|where|when|who)\b/.test(
+      lower
+    );
+  if (!isQuestion) return false;
+
+  const taskTokens = significantTaskTokens(activeTask.title);
+  if (taskTokens.length === 0) return false;
+
+  const messageTokens = significantTaskTokens(message);
+  const overlapsTask = messageTokens.some((t) => taskTokens.includes(t));
+
+  // Anaphora ("it", "that", "this") most plausibly points at the current task.
+  const explicitPronoun = /\b(it|that|this|there)\b/i.test(lower);
+  // Evidence from the recent conversation that the task is still being discussed.
+  const recentEvidence = recentTopics.some((rt) => {
+    const rtTokens = significantTaskTokens(rt);
+    return rtTokens.length > 0 && rtTokens.some((t) => taskTokens.includes(t));
+  });
+
+  if (overlapsTask) return true;
+  if (explicitPronoun) return true;
+  // A bare question right after task-related conversation is a follow-up.
+  if (recentEvidence && ownEntities.length === 0) return true;
+
+  return false;
+}
+
+/**
+ * Build the planning & task awareness context for the current user message.
+ * Ephemeral per-request context, never persisted by this function. Only
+ * produces a section when a task exists (or for explicit "What have I done?"
+ * questions about task history). Deterministic, no LLM.
+ */
+export function buildTaskContext(
+  message: string,
+  recentTopics: string[],
+  isTrivial: boolean
+): { section: string; isTaskRelated: boolean } {
+  const statement = detectTaskStatement(message);
+
+  // "What have I done?" works from history even without a current task.
+  if (statement.kind === "question" && statement.qtype === "doneHistory") {
+    const recent = getRecentTasks(3);
+    if (recent.length === 0) return { section: "", isTaskRelated: false };
+    return { section: formatRecentTasks(recent), isTaskRelated: true };
+  }
+
+  const activeTask = getActiveTaskContext();
+  if (!activeTask) return { section: "", isTaskRelated: false };
+
+  // "What's next?" surfaces the current task without inventing a step.
+  if (statement.kind === "question" && statement.qtype === "next") {
+    return { section: formatCurrentTask(activeTask), isTaskRelated: true };
+  }
+
+  // A message that is itself a task statement, or a follow-up/ambiguous
+  // question about the current task.
+  const isOwnStatement =
+    statement.kind === "create" ||
+    statement.kind === "progress" ||
+    statement.kind === "done";
+  const isFollowUp = isTaskFollowUp(
+    message,
+    extractEntities(message),
+    recentTopics,
+    isTrivial,
+    activeTask
+  );
+
+  if (!isOwnStatement && !isFollowUp) {
+    return { section: "", isTaskRelated: false };
+  }
+
+  return { section: formatCurrentTask(activeTask), isTaskRelated: true };
+}
+
+/**
+ * Clear all task context rows. Used by tests and debugging to reset the
+ * Planning & Task Awareness state without touching memories or projects.
+ */
+export function clearAllTaskContext(): number {
+  const db = getDb();
+  return db.prepare("DELETE FROM task_context").run().changes;
 }

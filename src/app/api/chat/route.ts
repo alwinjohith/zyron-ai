@@ -18,6 +18,11 @@ import {
   detectProjectIntroduction,
   createProjectContext,
   extractProjectName,
+  detectTaskStatement,
+  createTaskContext,
+  markActiveTaskInProgress,
+  completeActiveTask,
+  buildTaskContext,
   MAX_RELEVANT_MEMORIES,
 } from "@/lib/db";
 import type {
@@ -462,6 +467,26 @@ export async function POST(request: Request) {
       }
     }
 
+    // --- Stage 8: persist the user's current task ---
+    // Deterministic, rule-based. Only first-person task statements create or
+    // update task_context rows. Questions and ordinary chatter never persist.
+    const taskStatement = detectTaskStatement(userText);
+    if (taskStatement.kind === "create") {
+      createTaskContext(taskStatement.title!, taskStatement.status ?? "planned");
+      console.log(`[Task] Created active task: "${taskStatement.title}"`);
+    } else if (taskStatement.kind === "progress") {
+      if (taskStatement.title) {
+        createTaskContext(taskStatement.title, "in_progress");
+        console.log(`[Task] Created active task (in progress): "${taskStatement.title}"`);
+      } else {
+        markActiveTaskInProgress();
+        console.log("[Task] Marked active task as in progress");
+      }
+    } else if (taskStatement.kind === "done") {
+      completeActiveTask();
+      console.log("[Task] Completed active task");
+    }
+
     // --- Short-term (per-request) conversation context ---
     // Derives the active topic and any pronoun/follow-up hints for the latest
     // message. This is deterministic, rule-based, and never persisted.
@@ -486,6 +511,14 @@ export async function POST(request: Request) {
     );
     const projectSection = projectCtx.section;
 
+    // --- Stage 8: planning & task awareness context ---
+    const taskCtx = buildTaskContext(
+      userText,
+      shortTerm.activeTopics,
+      shortTerm.isTrivial
+    );
+    const taskSection = taskCtx.section;
+
     // Retrieve only the memories relevant to the current user message.
     // Trivial conversational filler ("hi", "how are you?", "okay") is skipped
     // entirely so it never triggers a broad long-term memory scan.
@@ -506,7 +539,7 @@ export async function POST(request: Request) {
       {
         role: "system",
         content:
-          SYSTEM_PROMPT + memoryPromptSection + shortTermSection + toneSection + projectSection,
+          SYSTEM_PROMPT + memoryPromptSection + shortTermSection + toneSection + projectSection + taskSection,
       },
       ...messages.map((m: { role: string; content: string }) => ({
         role: m.role,
