@@ -13,9 +13,14 @@ import {
   hasUpdateSignal,
   resolveMemoryConflict,
   buildShortTermContext,
+  buildToneContext,
   MAX_RELEVANT_MEMORIES,
 } from "@/lib/db";
-import type { RelevantMemory, RelevantMemoryContext } from "@/types/memory";
+import type {
+  RelevantMemory,
+  RelevantMemoryContext,
+  ToneContext,
+} from "@/types/memory";
 import type { ShortTermContext } from "@/lib/db";
 
 // Fix categories for any existing memories on startup
@@ -241,6 +246,32 @@ function formatShortTermContext(ctx: ShortTermContext): string {
   );
 }
 
+/**
+ * Build the "Tone" prompt section from the derived tone context.
+ * Produces a short directive telling Zyron how to match the user's emotional
+ * state. Returns an empty string for neutral messages and memory commands so
+ * nothing is added to the prompt for ordinary or memory-related turns. This
+ * is ephemeral — never persisted, and never influences memory creation.
+ */
+function formatToneContext(ctx: ToneContext): string {
+  if (!ctx.hasTone) return "";
+
+  const directives: Record<ToneContext["tone"], string> = {
+    positive:
+      "The user just shared a positive achievement or good news. Acknowledge it warmly and genuinely first, celebrate it briefly, then keep the rest of your answer concise and helpful. Do not force extra enthusiasm or emojis.",
+    distress:
+      "The user is frustrated, upset, or struggling. Acknowledge that briefly with empathy and reassurance, be supportive and encouraging rather than clinical, then move on to concrete help. Keep it calm and human; do not lecture.",
+    casual:
+      "The user is communicating casually and informally. Match an easygoing, natural, relaxed tone, but stay useful and concise. Do not over-formalize or become stiff.",
+    educational:
+      "The user is asking for an educational or neutral explanation. Keep the tone clear, accurate, and informative without unnecessary emotional language. Be thorough enough to actually explain, but stay organized and concise.",
+    neutral:
+      "",
+  };
+
+  return `\n\nTone: ${directives[ctx.tone]}`;
+}
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -422,6 +453,13 @@ export async function POST(request: Request) {
     const shortTerm = buildShortTermContext(userText, recentMessages);
     const shortTermSection = formatShortTermContext(shortTerm);
 
+    // --- Stage 6: deterministic emotional/tone context ---
+    // Classified with simple rules (no extra LLM call). Ephemeral and never
+    // persisted; read-only, so it can never interfere with memory creation.
+    // Appended after memory handling so it is purely additive.
+    const toneContext = buildToneContext(userText);
+    const toneSection = formatToneContext(toneContext);
+
     // Retrieve only the memories relevant to the current user message.
     // Trivial conversational filler ("hi", "how are you?", "okay") is skipped
     // entirely so it never triggers a broad long-term memory scan.
@@ -442,7 +480,7 @@ export async function POST(request: Request) {
       {
         role: "system",
         content:
-          SYSTEM_PROMPT + memoryPromptSection + shortTermSection,
+          SYSTEM_PROMPT + memoryPromptSection + shortTermSection + toneSection,
       },
       ...messages.map((m: { role: string; content: string }) => ({
         role: m.role,

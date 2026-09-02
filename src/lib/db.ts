@@ -1,7 +1,12 @@
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
-import type { MemoryCategory, RelevantMemory } from "@/types/memory";
+import type {
+  MemoryCategory,
+  RelevantMemory,
+  ToneContext,
+  ToneIntent,
+} from "@/types/memory";
 
 // Path to the SQLite database file
 // Stored in the project root so it persists between restarts.
@@ -1491,4 +1496,79 @@ export function buildShortTermContext(
   }
 
   return { activeTopics: recentTopics, pronounHints, followUpTopic, isTrivial };
+}
+
+// ============================================================
+// STAGE 6: DETERMINISTIC EMOTIONAL / TONE CONTEXT
+// ============================================================
+//
+// These helpers classify the user's message into a small set of tone intents
+// using simple, deterministic keyword rules — NO additional LLM call. The
+// result is a light directive the system prompt can use to respond
+// appropriately. It is ephemeral (per-request) and NEVER written to the
+// database, so it cannot interfere with long-term memory creation.
+
+// Words signalling explicit frustration, anger, or distress.
+const DISTRESS_PATTERNS: RegExp[] = [
+  /\b(frustrat\w*|angry|angr\w*|annoy\w*|furious|mad\b|stressed|stress\w*|overwhelm\w*)\b/i,
+  /\b(failed|fail\w*|wreck\w*|messed\s+up|broke\w*|broken)\b/i,
+  /\b(sad\b|sadden\w*|upset\b|down\b|depress\w*|miserable|crying|cry\b|tired\s+of)\b/i,
+  /\b(struggl\w*|stuck\b|cannot\s+figure|can'?t\s+figure|give\s+up|giving\s+up|hopeless|worried|worry\w*|anxious|anxiety)\b/i,
+  /\b(this\s+is\s+(so\s+)?(hard|difficult|impossible|terrible|awful))|(so\s+(annoying|frustrating|stressful))\b/i,
+];
+
+// Words signalling a positive achievement, good news, or excitement.
+const POSITIVE_PATTERNS: RegExp[] = [
+  /\b(finally\s+(finished|completed|done|solved|got|passed|fixed))\b/i,
+  /\b(finished|completed|done!|solved|passed|achieved|accomplished|succeeded|success)\b/i,
+  /\b(excited|awesome|amazing|great|fantastic|wonderful|excellent|happy|glad|thrilled|proud|superb|brilliant)\b/i,
+  /\b(got\s+(the\s+)?(job|offer|promotion|award)|won\b|victory|win\b)\b/i,
+  /\b(big\s+(news|win|milestone)|made\s+(it|progress)|progress)\b/i,
+];
+
+// Casual / informal markers.
+const CASUAL_PATTERNS: RegExp[] = [
+  /\b(bro|dude|man\b|bhai|dawg|hey\s+zyron|yo|gonna|wanna|cuz|k\b|thx|ty|pls|plz|btw)\b/i,
+];
+
+// Educational / neutral explanation or knowledge requests.
+const EDUCATIONAL_PATTERNS: RegExp[] = [
+  /^(explain|describe|what\s+is|what\s+are|define|elaborate|clarify|teach|walk\s+me\s+through|how\s+does|how\s+do)\b/i,
+  /\b(tutorial|concept|how\s+to|step\s+by\s+step|in\s+detail|in\s+depth)\b/i,
+];
+
+/**
+ * Classify a user message into a dominant tone intent.
+ * Order matters: distress and positivity are checked first because they are
+ * the strongest emotional signals; casual and educational are weaker and
+ * secondary. Returns "neutral" when no clear signal is found.
+ */
+export function classifyUserTone(message: string): ToneIntent {
+  const lower = message.toLowerCase().trim();
+  if (!lower) return "neutral";
+
+  const hasDistress = DISTRESS_PATTERNS.some((re) => re.test(lower));
+  if (hasDistress) return "distress";
+
+  const hasPositive = POSITIVE_PATTERNS.some((re) => re.test(lower));
+  if (hasPositive) return "positive";
+
+  const hasCasual = CASUAL_PATTERNS.some((re) => re.test(lower));
+  if (hasCasual) return "casual";
+
+  const hasEducational = EDUCATIONAL_PATTERNS.some((re) => re.test(lower));
+  if (hasEducational) return "educational";
+
+  return "neutral";
+}
+
+/**
+ * Build the ephemeral tone context for a user message.
+ * Deterministic, rule-based, never persisted. `hasTone` is false (and the
+ * caller injects nothing) for neutral messages and for memory commands, so
+ * personality directives never interfere with memory creation.
+ */
+export function buildToneContext(message: string): ToneContext {
+  const tone = classifyUserTone(message);
+  return { tone, hasTone: tone !== "neutral" };
 }

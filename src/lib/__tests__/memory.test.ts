@@ -13,6 +13,8 @@ import {
   isTrivialMessage,
   categorizeMemory,
   findDuplicateMemory,
+  classifyUserTone,
+  buildToneContext,
 } from "@/lib/db";
 
 beforeEach(() => {
@@ -380,5 +382,66 @@ describe("Stage 5: follow-up retrieval coupling", () => {
     // No follow-up topic => the fallback path must not fabricate a match.
     const relevant = getRelevantMemories("It is good.", []);
     expect(relevant.length).toBe(0);
+  });
+});
+
+describe("Stage 6: emotional / tone context", () => {
+  it("A: positive achievement is detected", () => {
+    expect(classifyUserTone("I finally finished my project!")).toBe("positive");
+    expect(classifyUserTone("Great news — I got the offer!")).toBe("positive");
+  });
+
+  it("B: distress / failure is detected", () => {
+    expect(classifyUserTone("I failed my exam today.")).toBe("distress");
+    expect(classifyUserTone("I'm really frustrated with this.")).toBe("distress");
+    expect(classifyUserTone("I'm stuck and can't figure this out.")).toBe("distress");
+  });
+
+  it("C: casual tone is detected", () => {
+    expect(classifyUserTone("Bro, help me fix this bug.")).toBe("casual");
+  });
+
+  it("D: educational / neutral explanation requests are detected", () => {
+    expect(classifyUserTone("Explain what a CPU is.")).toBe("educational");
+    expect(classifyUserTone("What is a CPU?")).toBe("educational");
+  });
+
+  it("E: ordinary neutral messages carry no tone directive", () => {
+    const ctx = buildToneContext("What time is it?");
+    expect(ctx.tone).toBe("neutral");
+    expect(ctx.hasTone).toBe(false);
+  });
+
+  it("F: memory creation is not interfered with (personality detection is read-only)", () => {
+    // A memory-save request must not be treated as an emotional tone directive.
+    const ctx = buildToneContext("Remember that I like Java.");
+    expect(ctx.hasTone).toBe(false);
+
+    // Saving the memory still works exactly as before.
+    const category = categorizeMemory("Remember that I like Java.");
+    resolveMemoryConflict("Remember that I like Java.", category);
+    createMemory("Remember that I like Java.", category);
+    const active = getAllMemories().map((m) => m.content);
+    expect(active.some((c) => c.includes("Java"))).toBe(true);
+  });
+
+  it("G: tone detection never persists anything to the database", () => {
+    buildToneContext("I finally finished my project!");
+    buildToneContext("I'm really frustrated with this.");
+
+    // No rows should have been created by tone detection alone.
+    expect(getAllMemories().length).toBe(0);
+  });
+
+  it("H: distress is prioritized over weaker signals", () => {
+    // A distress signal should win even if a casual marker is also present.
+    expect(
+      classifyUserTone("Bro, I'm so frustrated with this bug.")
+    ).toBe("distress");
+  });
+
+  it("I: empty / trivial content is neutral", () => {
+    expect(classifyUserTone("")).toBe("neutral");
+    expect(classifyUserTone("Hi")).toBe("neutral");
   });
 });

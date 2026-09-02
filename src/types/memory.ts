@@ -40,3 +40,19 @@ export interface RelevantMemoryContext {
   // Number of relevant memories retrieved (memories.length).
   count: number;
 }
+
+// Emotional / conversational tone detected from a user message.
+// This is ephemeral (per-request) and is NEVER written to the database.
+export type ToneIntent =
+  | "positive"     // achievement, good news, excitement
+  | "distress"     // failure, frustration, sadness, being stuck
+  | "casual"       // informal, colloquial ("bro", "hey", slang)
+  | "educational"  // neutral explanation / knowledge request
+  | "neutral";     // no clear tone signal
+
+export interface ToneContext {
+  // The dominant tone intent for the message.
+  tone: ToneIntent;
+  // True when a tone directive should be injected into the prompt.
+  hasTone: boolean;
+}
