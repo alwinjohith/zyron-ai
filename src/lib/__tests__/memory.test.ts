@@ -15,10 +15,17 @@ import {
   findDuplicateMemory,
   classifyUserTone,
   buildToneContext,
+  buildProjectContext,
+  detectProjectIntroduction,
+  createProjectContext,
+  extractProjectName,
+  getActiveProjectContext,
+  clearAllProjectContext,
 } from "@/lib/db";
 
 beforeEach(() => {
   clearAllMemories();
+  clearAllProjectContext();
 });
 
 describe("Stage 3: memory conflict / update resolution", () => {
@@ -443,5 +450,137 @@ describe("Stage 6: emotional / tone context", () => {
   it("I: empty / trivial content is neutral", () => {
     expect(classifyUserTone("")).toBe("neutral");
     expect(classifyUserTone("Hi")).toBe("neutral");
+  });
+});
+
+describe("Stage 7: project & goal awareness", () => {
+  it("A: detects an explicit project introduction", () => {
+    expect(detectProjectIntroduction("I'm building an ESP32 car.")).toBe(true);
+    expect(
+      detectProjectIntroduction("I am developing a web app with React.")
+    ).toBe(true);
+  });
+
+  it("B: does not detect ordinary conversation or questions as projects", () => {
+    expect(detectProjectIntroduction("What's the weather today?")).toBe(false);
+    expect(detectProjectIntroduction("The sensor isn't working.")).toBe(false);
+    expect(detectProjectIntroduction("I like pizza.")).toBe(false);
+    expect(detectProjectIntroduction("How are you?")).toBe(false);
+  });
+
+  it("C: creates an active project context for an intro", () => {
+    const project = createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+    expect(project.name).toBe("ESP32 car");
+    expect(getActiveProjectContext()?.name).toBe("ESP32 car");
+  });
+
+  it("D: only one project is active at a time (new intro replaces old)", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+    createProjectContext("Zyron", "I'm building Zyron.");
+
+    const active = getActiveProjectContext();
+    expect(active?.name).toBe("Zyron");
+
+    const db = getDb();
+    const all = db
+      .prepare("SELECT * FROM project_context ORDER BY id")
+      .all() as Array<{ is_active: number }>;
+    // Both rows still exist; only the newest is active.
+    expect(all.filter((r) => r.is_active === 1)).toHaveLength(1);
+  });
+
+  it("E: extracts a project name from an intro message", () => {
+    expect(extractProjectName("I'm building an ESP32 car.")).toBe("ESP32 car");
+    expect(extractProjectName("Let's build a smart home system.")).toBeTruthy();
+  });
+
+  it("F: a specific follow-up with its own project entity is associated", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+
+    const ctx = buildProjectContext(
+      "The sensor isn't working.",
+      ["esp32", "car"],
+      false
+    );
+
+    expect(ctx.section).toContain("ESP32 car");
+    expect(ctx.isFollowUp).toBe(true);
+  });
+
+  it("G: a bare substantive follow-up attaches to a specific active project", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+
+    const ctx = buildProjectContext("The sensor isn't working.", [], false);
+    expect(ctx.isFollowUp).toBe(true);
+    expect(ctx.section).toContain("ESP32 car");
+  });
+
+  it("H: an unrelated message with its own distinct topic is NOT a follow-up", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+
+    // Even though the ESP32 topic is still active in the conversation, a
+    // general-knowledge weather question must not be forced into the project.
+    const ctx = buildProjectContext(
+      "What's the weather today?",
+      ["esp32", "car", "weather"],
+      false
+    );
+    expect(ctx.isFollowUp).toBe(false);
+  });
+
+  it("H2: an unrelated question after a project message is NOT forced in", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+
+    // "it" carries no own topic; but "What time is it?" is generic knowledge.
+    const ctx = buildProjectContext(
+      "What time is it?",
+      ["esp32", "car"],
+      false
+    );
+    expect(ctx.isFollowUp).toBe(false);
+  });
+
+  it("H3: stage references attach as a follow-up only with existing evidence", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+
+    // "Stage 6" mentions project-work, but recent topics contain no ESP32
+    // evidence, so it stays ambiguous.
+    const noEvidence = buildProjectContext("I finished Stage 6.", [], false);
+    expect(noEvidence.isFollowUp).toBe(false);
+
+    // With recent conversation mentioning the project, it becomes a follow-up.
+    const withEvidence = buildProjectContext(
+      "I finished Stage 6.",
+      ["esp32"],
+      false
+    );
+    expect(withEvidence.isFollowUp).toBe(true);
+  });
+
+  it("I: ambiguous bare messages without a specific project are NOT forced in", () => {
+    // A project with only generic words offers no strong evidence.
+    createProjectContext("Projects", "I'm building projects.");
+
+    const ctx = buildProjectContext("What's next?", [], false);
+    expect(ctx.isFollowUp).toBe(false);
+  });
+
+  it("J: project context does not interfere with memory creation/retrieval", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+
+    // Normal memory creation still works.
+    createMemory("My favorite color is green.", "preferences");
+    const relevant = getRelevantMemories("What is my favorite color?");
+    const texts = relevant.map((m) => m.content);
+    expect(texts.some((c) => c.includes("green"))).toBe(true);
+
+    // Project context rows are separate from memories.
+    expect(getAllMemories().length).toBe(1);
+  });
+
+  it("K: project intro does not become a memory row", () => {
+    const project = createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+    expect(project).toBeTruthy();
+    expect(getAllMemories().length).toBe(0);
   });
 });

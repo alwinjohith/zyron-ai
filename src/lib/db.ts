@@ -58,6 +58,19 @@ export function getDb(): Database.Database {
     db.exec("ALTER TABLE memories ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1");
   }
 
+  // Stage 7: lightweight active project context (additive, no migration of memories).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS project_context (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      goal TEXT NOT NULL DEFAULT '',
+      is_active INTEGER NOT NULL DEFAULT 1,
+      createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+      updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
   return db;
 }
 
@@ -1571,4 +1584,261 @@ export function classifyUserTone(message: string): ToneIntent {
 export function buildToneContext(message: string): ToneContext {
   const tone = classifyUserTone(message);
   return { tone, hasTone: tone !== "neutral" };
+}
+
+// ============================================================
+// STAGE 7: PROJECT & GOAL AWARENESS
+// ============================================================
+//
+// Lightweight, persistent tracking of the user's active project/goal.
+// Separate from long-term memories — updates here do NOT create memory rows.
+// The project_context table is additive and never modifies the memories table.
+
+interface ProjectContextRow {
+  id: number;
+  name: string;
+  description: string;
+  goal: string;
+  is_active: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Create a new active project context or reactivate/update an existing one.
+ * Deactivates any previously active project (only one active at a time).
+ * Does NOT create a memory row.
+ */
+export function createProjectContext(
+  name: string,
+  description: string = "",
+  goal: string = ""
+): ProjectContextRow {
+  const db = getDb();
+  db.prepare("UPDATE project_context SET is_active = 0 WHERE is_active = 1").run();
+  const result = db
+    .prepare(
+      "INSERT INTO project_context (name, description, goal) VALUES (?, ?, ?)"
+    )
+    .run(name, description, goal);
+  return {
+    id: Number(result.lastInsertRowid),
+    name,
+    description,
+    goal,
+    is_active: 1,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Get the most recently updated active project context.
+ * Returns null when no project is active.
+ */
+export function getActiveProjectContext(): ProjectContextRow | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      "SELECT * FROM project_context WHERE is_active = 1 ORDER BY updatedAt DESC LIMIT 1"
+    )
+    .get() as ProjectContextRow | undefined;
+  return row ?? null;
+}
+
+/**
+ * Update the description/goal of the active project context (in place).
+ * Does NOT create a memory row.
+ */
+export function updateActiveProjectContext(updates: {
+  description?: string;
+  goal?: string;
+}): ProjectContextRow | null {
+  const current = getActiveProjectContext();
+  if (!current) return null;
+  const db = getDb();
+  const description = updates.description ?? current.description;
+  const goal = updates.goal ?? current.goal;
+  db.prepare(
+    "UPDATE project_context SET description = ?, goal = ?, updatedAt = datetime('now') WHERE id = ?"
+  ).run(description, goal, current.id);
+  return {
+    ...current,
+    description,
+    goal,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Phrases that strongly indicate the user is starting or actively building a
+ * specific project (not a general statement or a question).
+ */
+const PROJECT_INTRO_PATTERNS: RegExp[] = [
+  /\b(?:i'm|i am|im)\s+(?:building|creating|making|developing|working\s+on)\b/i,
+  /\b(?:i(?:'m|\s+am)?)\s+(?:starting|starting\s+to)\s+(?:build|create|make|develop|work\s+on)\b/i,
+  /\b(?:i\s+started|started)\s+(?:building|creating|making|developing|working\s+on)\b/i,
+  /\b(?:let'?s\s+build|let'?s\s+create|let'?s\s+make)\b/i,
+  /\b(?:i(?:'m|\s+am)?)\s+(?:building|creating|making|developing)\s+a\s+new\b/i,
+];
+
+/**
+ * Detect whether a user message introduces a new project or goal.
+ * Conservative: only matches explicit creation/development statements.
+ * Does NOT match questions, general chatter, or vague mentions.
+ */
+export function detectProjectIntroduction(message: string): boolean {
+  const lower = message.toLowerCase();
+  const hasSignal = PROJECT_INTRO_PATTERNS.some((re) => re.test(lower));
+  if (!hasSignal) return false;
+  if (message.trim().length < 15) return false;
+  const category = categorizeMemory(message);
+  if (category === "general") return false;
+  return true;
+}
+
+/**
+ * Extract a project name from an introductory message.
+ * Uses the fact-slot extractor and falls back to keyword extraction.
+ * Returns null when no project name can be determined.
+ */
+export function extractProjectName(message: string): string | null {
+  // Fall back to keyword extraction from the ORIGINAL (cased) message so
+  // proper nouns like "ESP32" or "Zyron" keep their capitalization.
+  const m = message.match(
+    /\b(?:i'm|i am|im|let'?s)\s+(?:building|build|creating|create|making|make|developing|develop|working\s+on)\s+(?:a\s+|an\s+|the\s+|my\s+)?(.+)/i
+  );
+  if (m) {
+    let name = m[1].trim().replace(/[.!?]+$/, "").trim();
+    if (name.length > 0) {
+      name = name.charAt(0).toUpperCase() + name.slice(1);
+      if (name.length > 40) name = name.slice(0, 40).trim();
+      return name;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Words/phrases that revisit an ongoing project's progress rather than
+ * introducing a brand-new topic. Combined with existing conversation context
+ * they provide evidence that a message continues the active project.
+ */
+const PROJECT_REFERENCE_KEYWORDS = new Set([
+  "stage", "phase", "step", "version", "milestone", "prototype", "iteration",
+  "status", "progress", "finished", "finishing", "done", "complete", "next",
+]);
+
+/**
+ * Deterministically detect whether a message is a follow-up to the active
+ * project. Uses the message's OWN entities (no pronoun resolution), the user
+ * message intent, and recent conversation topics as evidence.
+ */
+function isProjectFollowUp(
+  message: string,
+  ownEntities: string[],
+  recentTopics: string[],
+  isTrivial: boolean,
+  activeProject: ProjectContextRow | null
+): boolean {
+  if (!activeProject) return false;
+  if (isTrivial) return false;
+
+  const intent = classifyUserIntent(message);
+  if (intent === "general_knowledge" || intent === "greeting") return false;
+
+  const ownEntitySet = new Set(ownEntities.map((e) => e.toLowerCase()));
+  const projectNameLower = activeProject.name.toLowerCase();
+  const projectWords = projectNameLower.split(/\s+/).filter((w) => w.length >= 3);
+
+  const overlapsProject = (value: string): boolean => {
+    const v = value.toLowerCase();
+    if (v === projectNameLower) return true;
+    return projectWords.some((w) => v.split(/\s+/).includes(w));
+  };
+
+  // Message introduces its own topic entities — project continuity holds only
+  // when one of them overlaps the active project.
+  if (ownEntities.length > 0) {
+    if (ownEntitySet.has(projectNameLower)) return true;
+    for (const word of projectWords) {
+      if (ownEntitySet.has(word)) return true;
+    }
+    // "I finished Stage 6." under an active project is only a follow-up when
+    // the recent conversation already mentions the project (strong evidence).
+    const referencesProjectWork = extractTopicTokens(message).some((t) =>
+      PROJECT_REFERENCE_KEYWORDS.has(t)
+    );
+    if (referencesProjectWork && recentTopics.some(overlapsProject)) {
+      return true;
+    }
+    return false;
+  }
+
+  // Bare message (no entities of its own). Only attach when the project is
+  // specific enough to anchor on and the message is substantive, and it is not
+  // an unrelated question (general-knowledge/greeting already excluded above).
+  const nonGenericProjectWords = projectWords.filter(
+    (w) => !GENERIC_TOPIC_WORDS.has(w) && !STOPWORDS.has(w)
+  );
+  if (nonGenericProjectWords.length === 0) return false;
+  if (message.trim().length < 5) return false;
+
+  return true;
+}
+
+/**
+ * Build the project context for the current user message.
+ * Ephemeral per-request context that helps Zyron understand ongoing projects.
+ * Only produces a section when an active project exists. Deterministic, no LLM.
+ */
+export function buildProjectContext(
+  message: string,
+  recentTopics: string[],
+  isTrivial: boolean
+): { section: string; isFollowUp: boolean } {
+  const activeProject = getActiveProjectContext();
+  if (!activeProject) return { section: "", isFollowUp: false };
+
+  const ownEntities = extractEntities(message);
+  const isFollowUp = isProjectFollowUp(
+    message,
+    ownEntities,
+    recentTopics,
+    isTrivial,
+    activeProject
+  );
+
+  const parts: string[] = [];
+  parts.push(`Active project: ${activeProject.name}`);
+
+  if (activeProject.goal) {
+    parts.push(`Current goal: ${activeProject.goal}`);
+  }
+  if (activeProject.description) {
+    parts.push(`Project details: ${activeProject.description}`);
+  }
+  if (isFollowUp) {
+    parts.push(
+      "This message appears to be a follow-up about the active project."
+    );
+  }
+
+  return {
+    section:
+      "\n\nProject context:\n" +
+      parts.join("\n") +
+      "\n(This is internal context about the user's active project. Use it to understand project-related follow-ups. Do not mention this context to the user unless they ask about their project.)",
+    isFollowUp,
+  };
+}
+
+/**
+ * Clear all project context rows. Used by tests and debugging to reset the
+ * Project & Goal Awareness state without touching the memories table.
+ */
+export function clearAllProjectContext(): number {
+  const db = getDb();
+  return db.prepare("DELETE FROM project_context").run().changes;
 }

@@ -14,6 +14,10 @@ import {
   resolveMemoryConflict,
   buildShortTermContext,
   buildToneContext,
+  buildProjectContext,
+  detectProjectIntroduction,
+  createProjectContext,
+  extractProjectName,
   MAX_RELEVANT_MEMORIES,
 } from "@/lib/db";
 import type {
@@ -446,6 +450,18 @@ export async function POST(request: Request) {
       }
     }
 
+    // --- Stage 7: detect & persist a newly introduced project ---
+    // Only for explicit creation/development statements (e.g. "I'm building an
+    // ESP32 car."). This writes to project_context, never to memories. Ordinary
+    // conversation and questions are never turned into a project.
+    if (detectProjectIntroduction(userText)) {
+      const extracted = extractProjectName(userText);
+      if (extracted) {
+        createProjectContext(extracted, userText);
+        console.log(`[Project] Created active project context: "${extracted}"`);
+      }
+    }
+
     // --- Short-term (per-request) conversation context ---
     // Derives the active topic and any pronoun/follow-up hints for the latest
     // message. This is deterministic, rule-based, and never persisted.
@@ -459,6 +475,16 @@ export async function POST(request: Request) {
     // Appended after memory handling so it is purely additive.
     const toneContext = buildToneContext(userText);
     const toneSection = formatToneContext(toneContext);
+
+    // --- Stage 7: project & goal awareness ---
+    // Lightweight, persistent project context. Separate from long-term
+    // memories. Does not create memory rows for follow-up messages.
+    const projectCtx = buildProjectContext(
+      userText,
+      shortTerm.activeTopics,
+      shortTerm.isTrivial
+    );
+    const projectSection = projectCtx.section;
 
     // Retrieve only the memories relevant to the current user message.
     // Trivial conversational filler ("hi", "how are you?", "okay") is skipped
@@ -480,7 +506,7 @@ export async function POST(request: Request) {
       {
         role: "system",
         content:
-          SYSTEM_PROMPT + memoryPromptSection + shortTermSection + toneSection,
+          SYSTEM_PROMPT + memoryPromptSection + shortTermSection + toneSection + projectSection,
       },
       ...messages.map((m: { role: string; content: string }) => ({
         role: m.role,
