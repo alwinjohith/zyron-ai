@@ -6,6 +6,10 @@ import type {
   RelevantMemory,
   ToneContext,
   ToneIntent,
+  PreferenceCategory,
+  PreferenceConfidence,
+  UserPreference,
+  PreferenceDetectionResult,
 } from "@/types/memory";
 
 // Path to the SQLite database file
@@ -86,6 +90,25 @@ export function getDb(): Database.Database {
   `);
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_task_context_active ON task_context (is_active, updatedAt)"
+  );
+
+  // Stage 9: user preferences — durable, key-value style personalization.
+  // Separate from memories so they never leak into memory retrieval/listings.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_preference (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      category TEXT NOT NULL DEFAULT 'general',
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      confidence TEXT NOT NULL DEFAULT 'medium'
+        CHECK (confidence IN ('high','medium','low')),
+      is_active INTEGER NOT NULL DEFAULT 1,
+      createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+      updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_user_preference_active ON user_preference (is_active, key)"
   );
 
   return db;
@@ -2321,4 +2344,713 @@ export function buildTaskContext(
 export function clearAllTaskContext(): number {
   const db = getDb();
   return db.prepare("DELETE FROM task_context").run().changes;
+}
+
+// ============================================================
+// STAGE 9: DEEPER PERSONALIZATION — USER PREFERENCES
+// ============================================================
+//
+// Durable user preferences stored in a dedicated table, separate from
+// long-term memories. Detection is deterministic and rule-based (no extra LLM
+// calls). Preferences are retrieved based on relevance to the current message
+// and injected as concise guidance into the system prompt.
+
+// Strong explicit preference language (high confidence).
+const STRONG_PREFERENCE_PATTERNS: RegExp[] = [
+  /\bfrom\s+now\s+on\b/i,
+  /\bplease\s+always\b/i,
+  /\balways\s+(?:give|do|use|keep|make|put|start|write|format|answer|respond|reply|explain|show|send)\b/i,
+  /\bdon'?t\s+(?:ever\s+)?(?:give|do|use|keep|make|put|start|write|format|answer|respond|reply|explain|show|send)\b/i,
+  /\bnever\s+(?:give|do|use|keep|make|put|start|write|format|answer|respond|reply|explain|show|send)\b/i,
+  /\bwhen\s+we'?re\s+(?:coding|programming|working|developing|building)\b/i,
+  /\bi\s+want\s+you\s+to\b/i,
+];
+
+// Instruction delivery patterns — always high confidence when matched,
+// because they are explicitly about how Zyron should deliver instructions.
+const INSTRUCTION_DELIVERY_PATTERNS: RegExp[] = [
+  /\b(step\s+by\s+step|one\s+step\s+at\s+a\s+time|individual\s+steps?)\b/i,
+  /\b(all\s+(?:the\s+)?(?:commands?|steps?|instructions?)\s+(?:together|at\s+once)|everything\s+together|all\s+at\s+once)\b/i,
+  /\bgive\s+me\s+(?:one\s+step\s+at\s+a\s+time|all\s+(?:the\s+)?(?:commands?|steps?|instructions?)\s+(?:together|at\s+once)|step\s+by\s+step)\b/i,
+];
+
+// Medium explicit preference language — only patterns that are clearly
+// about preferences (not personal habits or intentions).
+const MEDIUM_PREFERENCE_PATTERNS: RegExp[] = [
+  /\bi\s+prefer\b/i,
+  /\bi\s+like\b/i,
+];
+
+// Weak / uncertain preference language (low confidence).
+const WEAK_PREFERENCE_PATTERNS: RegExp[] = [
+  /\bi\s+think\s+i\s+(?:might|may|could)\s+(?:prefer|like|want)\b/i,
+  /\bi\s+(?:might|may|could)\s+(?:prefer|like|want)\b/i,
+  /\bi'?m\s+(?:kind\s+of|sort\s+of|somewhat)\s+(?:into|a\s+fan\s+of|liking)\b/i,
+];
+
+// Phrases that signal a TEMPORARY request, NOT a durable preference.
+const TEMPORARY_REQUEST_PATTERNS: RegExp[] = [
+  /\bfor\s+(?:this|that|the\s+next|this\s+one|this\s+answer|this\s+time|now)\b/i,
+  /\bthis\s+time\b/i,
+  /\bjust\s+(?:this\s+once|for\s+now|for\s+this)\b/i,
+  /\bcan\s+you\s+(?:just|please)?\s*(?:keep|make|give|do)\b/i,
+  /\bwould\s+(?:you|it)\s+(?:mind|be\s+possible)\b/i,
+  /\bi'?d\s+(?:like|prefer)\s+(?:it\s+)?(?:if\s+you|to)\b/i,
+  /\bkeep\s+it\s+(?:short|brief|simple|concise|long|detailed)\b/i,
+  /\b(?:short|brief|simple|concise|long|detailed)\s+(?:answer|response|explanation)\b/i,
+];
+
+// Mapping from preference key keywords to categories.
+const KEYWORD_CATEGORY_MAP: Record<string, PreferenceCategory> = {
+  // communication
+  "explanation": "communication", "explanations": "communication",
+  "response": "communication", "responses": "communication",
+  "reply": "communication", "replies": "communication",
+  "tone": "communication", "style": "communication",
+  "detail": "communication", "details": "communication",
+  "step": "communication", "steps": "communication",
+  "summary": "communication", "format": "communication",
+  // coding
+  "code": "coding", "coding": "coding", "programming": "coding",
+  "language": "coding", "syntax": "coding", "debug": "coding",
+  "testing": "coding", "tests": "coding", "linting": "coding",
+  "typescript": "coding", "javascript": "coding", "python": "coding",
+  "java": "coding", "rust": "coding", "react": "coding",
+  // workflow
+  "workflow": "workflow", "process": "workflow", "approach": "workflow",
+  "method": "workflow", "organization": "workflow", "structure": "workflow",
+  "pace": "workflow", "order": "workflow", "sequence": "workflow",
+  // technology
+  "editor": "technology", "ide": "technology", "tool": "technology",
+  "terminal": "technology", "shell": "technology", "browser": "technology",
+  "os": "technology", "platform": "technology", "framework": "technology",
+  // content
+  "writing": "content", "blog": "content", "email": "content",
+  "document": "content", "documentation": "content",
+  "message": "content", "chat": "content",
+};
+
+// ============================================================
+// PREFERENCE CONCEPT NORMALIZATION
+// ============================================================
+//
+// Maps raw extracted values to stable, normalized preference concepts.
+// This ensures semantically equivalent or conflicting statements share
+// the same key so conflict resolution works correctly.
+
+interface NormalizedPreference {
+  key: string;
+  value: string;
+  category: PreferenceCategory;
+}
+
+/**
+ * Normalize a raw preference value/message into a stable concept key and
+ * human-readable value. Uses deterministic pattern matching — no NLM.
+ * Falls back to the raw key/value when no concept matches.
+ */
+function normalizePreferenceValue(
+  rawValue: string,
+  message: string
+): NormalizedPreference {
+  const lower = (rawValue + " " + message).toLowerCase();
+
+  // --- Instruction delivery ---
+  if (/\b(step\s+by\s+step|one\s+step\s+at\s+a\s+time|individual\s+steps?|each\s+step\s+separately)\b/.test(lower)) {
+    return { key: "instruction_delivery", value: "Step by step", category: "communication" };
+  }
+  if (/\b(all\s+(?:the\s+)?(?:commands?|steps?|instructions?)\s+(?:together|at\s+once)|everything\s+together|all\s+at\s+once|batch(?:ed)?)\b/.test(lower)) {
+    return { key: "instruction_delivery", value: "All at once", category: "communication" };
+  }
+
+  // --- Response length ---
+  if (/\b(short|concise|brief|terse)\b/.test(lower) &&
+      /\b(explanations?|responses?|answers?|replies?|explain|keep\s+it)\b/.test(lower)) {
+    return { key: "response_length", value: "Concise", category: "communication" };
+  }
+  if (/\b(detailed|in\s+depth|comprehensive|thorough|elaborate)\b/.test(lower) &&
+      /\b(explanations?|responses?|answers?|replies?|explain|go\s+into)\b/.test(lower)) {
+    return { key: "response_length", value: "Detailed", category: "communication" };
+  }
+
+  // --- Tone / style ---
+  if (/\b(formal|professional|technical)\b/.test(lower) &&
+      /\b(tone|style|language|writing|communication)\b/.test(lower)) {
+    return { key: "tone_style", value: "Formal", category: "communication" };
+  }
+  if (/\b(casual|informal|relaxed|friendly|chill)\b/.test(lower) &&
+      /\b(tone|style|language|writing|communication)\b/.test(lower)) {
+    return { key: "tone_style", value: "Casual", category: "communication" };
+  }
+
+  // --- Language preference (check "X over Y" first, then standalone) ---
+  if (/\b(typescript|ts)\b/.test(lower) && /\bover\b/.test(lower) && /\b(javascript|js)\b/.test(lower)) {
+    return { key: "preferred_language", value: "TypeScript", category: "coding" };
+  }
+  if (/\b(javascript|js)\b/.test(lower) && /\bover\b/.test(lower) && /\b(typescript|ts)\b/.test(lower)) {
+    return { key: "preferred_language", value: "JavaScript", category: "coding" };
+  }
+  if (/\b(python)\b/.test(lower) && /\bover\b/.test(lower) && /\b(java|javascript|js|typescript|ts|rust|c\+\+)\b/.test(lower)) {
+    return { key: "preferred_language", value: "Python", category: "coding" };
+  }
+  if (/\b(java)\b/.test(lower) && /\bover\b/.test(lower) && /\b(python|javascript|js|typescript|ts|rust)\b/.test(lower) && !/\b(javascript)\b/.test(lower)) {
+    return { key: "preferred_language", value: "Java", category: "coding" };
+  }
+  if (/\b(rust)\b/.test(lower) && /\bover\b/.test(lower) && /\b(java|python|c\+\+)\b/.test(lower)) {
+    return { key: "preferred_language", value: "Rust", category: "coding" };
+  }
+  // Standalone language mention
+  if (/\b(typescript|ts)\b/.test(lower) && !/\b(javascript|js)\b/.test(lower)) {
+    return { key: "preferred_language", value: "TypeScript", category: "coding" };
+  }
+  if (/\b(javascript|js)\b/.test(lower) && !/\b(typescript|ts)\b/.test(lower)) {
+    return { key: "preferred_language", value: "JavaScript", category: "coding" };
+  }
+  if (/\b(python)\b/.test(lower)) {
+    return { key: "preferred_language", value: "Python", category: "coding" };
+  }
+  if (/\b(java)\b/.test(lower) && !/\b(javascript)\b/.test(lower)) {
+    return { key: "preferred_language", value: "Java", category: "coding" };
+  }
+  if (/\b(rust)\b/.test(lower)) {
+    return { key: "preferred_language", value: "Rust", category: "coding" };
+  }
+
+  // --- Implementation workflow ---
+  if (/\b(inspect|check|review|look\s+at|understand|read)\b.*\b(before|prior\s+to|first)\b/.test(lower) ||
+      /\b(before|prior\s+to)\b.*\b(implement|change|modify|edit|write|code)\b/.test(lower)) {
+    return { key: "implementation_workflow", value: "Inspect before implementing", category: "workflow" };
+  }
+
+  // Fallback: use the raw value with inferred category.
+  return {
+    key: normalizePreferenceKey(rawValue),
+    value: capitalizeFirst(rawValue),
+    category: inferPreferenceCategory(rawValue, message),
+  };
+}
+
+/**
+ * Create a new user preference or update an existing one for the same key.
+ * If an active preference with the same key already exists, it is deactivated
+ * (conflict resolution). Returns the new/updated preference row.
+ */
+export function createUserPreference(
+  category: PreferenceCategory,
+  key: string,
+  value: string,
+  confidence: PreferenceConfidence = "medium"
+): UserPreference {
+  const db = getDb();
+  // Deactivate any existing active preference for this key.
+  db.prepare(
+    "UPDATE user_preference SET is_active = 0, updatedAt = datetime('now') WHERE key = ? AND is_active = 1"
+  ).run(key);
+
+  const result = db
+    .prepare(
+      "INSERT INTO user_preference (category, key, value, confidence) VALUES (?, ?, ?, ?)"
+    )
+    .run(category, key, value, confidence);
+
+  return {
+    id: Number(result.lastInsertRowid),
+    category,
+    key,
+    value,
+    confidence,
+    is_active: 1,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Get all ACTIVE user preferences.
+ */
+export function getActiveUserPreferences(): UserPreference[] {
+  const db = getDb();
+  return db
+    .prepare(
+      "SELECT * FROM user_preference WHERE is_active = 1 ORDER BY updatedAt DESC"
+    )
+    .all() as UserPreference[];
+}
+
+/**
+ * Get ALL user preferences (including inactive) for debugging/tests.
+ */
+export function getAllUserPreferences(): UserPreference[] {
+  const db = getDb();
+  return db
+    .prepare("SELECT * FROM user_preference ORDER BY id DESC")
+    .all() as UserPreference[];
+}
+
+/**
+ * Get the active preference for a specific key, or null.
+ */
+export function getPreferenceByKey(key: string): UserPreference | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      "SELECT * FROM user_preference WHERE key = ? AND is_active = 1 LIMIT 1"
+    )
+    .get(key) as UserPreference | undefined;
+  return row ?? null;
+}
+
+/**
+ * Clear all user preferences. Used by tests and debugging.
+ */
+export function clearAllUserPreferences(): number {
+  const db = getDb();
+  return db.prepare("DELETE FROM user_preference").run().changes;
+}
+
+// Keywords that map a user message topic to relevant preference categories.
+const TOPIC_CATEGORY_HINTS: Record<string, PreferenceCategory[]> = {
+  "code": ["coding", "workflow"],
+  "coding": ["coding", "workflow"],
+  "programming": ["coding", "workflow"],
+  "debug": ["coding"],
+  "bug": ["coding"],
+  "error": ["coding"],
+  "test": ["coding"],
+  "explain": ["communication"],
+  "response": ["communication"],
+  "answer": ["communication"],
+  "reply": ["communication"],
+  "format": ["communication", "coding"],
+  "project": ["workflow", "coding"],
+  "task": ["workflow"],
+  "workflow": ["workflow"],
+  "setup": ["technology", "workflow"],
+  "editor": ["technology"],
+  "ide": ["technology"],
+  "tool": ["technology"],
+  "terminal": ["technology"],
+  "react": ["coding", "technology"],
+  "python": ["coding", "technology"],
+  "typescript": ["coding", "technology"],
+  "javascript": ["coding", "technology"],
+  "java": ["coding", "technology"],
+  "rust": ["coding", "technology"],
+  "writing": ["content"],
+  "blog": ["content"],
+  "email": ["content"],
+  "document": ["content"],
+  "help": ["communication", "workflow"],
+  "fix": ["coding"],
+  "build": ["coding", "workflow"],
+  "develop": ["coding", "workflow"],
+  "create": ["coding", "workflow"],
+  "install": ["technology"],
+  "use": ["technology", "workflow"],
+};
+
+/**
+ * Map a detected preference key to the most appropriate category.
+ * Uses keyword heuristics when the key itself doesn't obviously belong.
+ */
+function inferPreferenceCategory(key: string, value: string): PreferenceCategory {
+  const lower = (key + " " + value).toLowerCase();
+
+  // Check if the key/value directly matches a known category keyword.
+  for (const [keyword, cats] of Object.entries(TOPIC_CATEGORY_HINTS)) {
+    if (lower.includes(keyword)) {
+      return cats[0]; // first match is most relevant
+    }
+  }
+
+  // Check explicit KEYWORD_CATEGORY_MAP.
+  const keyTokens = key.split(/[_\s]+/);
+  for (const token of keyTokens) {
+    if (KEYWORD_CATEGORY_MAP[token]) {
+      return KEYWORD_CATEGORY_MAP[token];
+    }
+  }
+
+  return "general";
+}
+
+/**
+ * Extract a normalized preference key and value from a detected preference.
+ * The key is a short, stable identifier (e.g., "response_style", "code_explanation").
+ * The value is the user's stated preference.
+ */
+function extractPreferenceKeyValue(
+  message: string
+): { key: string; value: string } | null {
+  const lower = message.toLowerCase();
+
+  // "I think I might prefer X" / "I might prefer X" / "I may prefer X"
+  let m = lower.match(/\bi\s+(?:think\s+i\s+)?(?:might|may|could)\s+(?:prefer|like|want)\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").trim();
+    return { key: normalizePreferenceKey(raw), value: capitalizeFirst(raw) };
+  }
+
+  // "I prefer X" / "I like X"
+  m = lower.match(/\bi\s+prefer\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").trim();
+    return { key: normalizePreferenceKey(raw), value: capitalizeFirst(raw) };
+  }
+
+  m = lower.match(/\bi\s+like\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").trim();
+    return { key: normalizePreferenceKey(raw), value: capitalizeFirst(raw) };
+  }
+
+  // "I don't like X" / "I hate X"
+  m = lower.match(/\bi\s+don'?t\s+like\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").trim();
+    return { key: "avoid_" + normalizePreferenceKey(raw), value: "Avoid " + capitalizeFirst(raw) };
+  }
+
+  m = lower.match(/\bi\s+hate\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").trim();
+    return { key: "avoid_" + normalizePreferenceKey(raw), value: "Avoid " + capitalizeFirst(raw) };
+  }
+
+  // "From now on, ..." / "Please always ..." / "Don't ..."
+  m = lower.match(/from\s+now\s+on[,:]?\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").trim();
+    return { key: normalizePreferenceKey(raw), value: capitalizeFirst(raw) };
+  }
+
+  m = lower.match(/(?:please\s+)?always\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").trim();
+    return { key: normalizePreferenceKey(raw), value: capitalizeFirst(raw) };
+  }
+
+  m = lower.match(/(?:please\s+)?(?:don'?t|never)\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").trim();
+    return { key: "avoid_" + normalizePreferenceKey(raw), value: "Never " + capitalizeFirst(raw) };
+  }
+
+  // "I want you to X"
+  m = lower.match(/\bi\s+want\s+you\s+to\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").trim();
+    return { key: normalizePreferenceKey(raw), value: capitalizeFirst(raw) };
+  }
+
+  // "When we're coding, ..."
+  m = lower.match(/when\s+we'?re\s+(?:coding|programming|working|developing|building)[,:]?\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").trim();
+    return { key: normalizePreferenceKey(raw), value: capitalizeFirst(raw) };
+  }
+
+  // "Give me X" / "Give me X please"
+  m = lower.match(/\bgive\s+me\s+(.{3,80})/);
+  if (m) {
+    const raw = m[1].replace(/[.!?]+$/, "").replace(/\s*please\s*$/i, "").trim();
+    return { key: normalizePreferenceKey(raw), value: capitalizeFirst(raw) };
+  }
+
+  return null;
+}
+
+/**
+ * Normalize a preference key: lowercase, replace spaces with underscores,
+ * strip special chars, cap length.
+ */
+function normalizePreferenceKey(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, "_")
+    .slice(0, 60)
+    .replace(/_+$/, "");
+}
+
+function capitalizeFirst(s: string): string {
+  if (!s) return s;
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/**
+ * Check whether the extracted preference value is about a valid Zyron-related
+ * topic (communication, coding, workflow, technology, content). Used to filter
+ * out personal habits and intentions like "I want to go to the gym" which
+ * contain preference signal words but are not about how Zyron should behave.
+ */
+function isValidPreferenceContext(value: string, message: string): boolean {
+  const lower = (value + " " + message).toLowerCase();
+
+  // Communication / response keywords
+  if (/\b(explanation|explanations|response|answer|reply|explain|format|style|tone|detail|details|step|steps|brief|concise|short|long|formal|casual|code\s+style)\b/.test(lower)) {
+    return true;
+  }
+
+  // Coding / workflow keywords
+  if (/\b(code|coding|programming|debug|test|tests|lint|build|develop|implement|project|workflow|typescript|javascript|python|java|rust|react|node|editor|ide|tool|inspect|review|check)\b/.test(lower)) {
+    return true;
+  }
+
+  // Technology keywords
+  if (/\b(language|framework|library|editor|ide|terminal|shell|browser|os|platform)\b/.test(lower)) {
+    return true;
+  }
+
+  // Content keywords
+  if (/\b(writing|blog|email|document|documentation|message|chat)\b/.test(lower)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Deterministically detect whether a user message expresses a durable
+ * user preference. Returns a detection result with key, value, category,
+ * and confidence. Temporary requests are flagged and should NOT be persisted.
+ *
+ * Detection hierarchy:
+ * 1. Instruction delivery patterns → always high confidence
+ * 2. Other strong patterns → high confidence
+ * 3. Medium patterns (I prefer, I like) → medium confidence, requires valid context
+ * 4. Weak patterns → low confidence, requires valid context
+ */
+export function detectUserPreference(
+  message: string
+): PreferenceDetectionResult {
+  const lower = message.toLowerCase().trim();
+
+  const empty: PreferenceDetectionResult = {
+    detected: false,
+    key: null,
+    value: null,
+    category: null,
+    confidence: "low",
+    isTemporary: false,
+  };
+
+  // Must not be a question — preferences are declarative.
+  if (lower.endsWith("?")) return empty;
+
+  // Must not be a memory command.
+  if (/^(remember|save|forget|what do you remember)/i.test(lower)) return empty;
+
+  // Must not be a greeting.
+  if (/^(hi|hello|hey|good morning|good evening|howdy)\b/.test(lower)) return empty;
+
+  // Check for temporary request patterns first.
+  const isTemporary = TEMPORARY_REQUEST_PATTERNS.some((re) => re.test(lower));
+  if (isTemporary) {
+    return { ...empty, isTemporary: true };
+  }
+
+  // --- 1. Instruction delivery patterns (always high confidence) ---
+  for (const pattern of INSTRUCTION_DELIVERY_PATTERNS) {
+    if (pattern.test(lower)) {
+      const extracted = extractPreferenceKeyValue(message);
+      if (extracted) {
+        const normalized = normalizePreferenceValue(extracted.value, message);
+        return {
+          detected: true,
+          key: normalized.key,
+          value: normalized.value,
+          category: normalized.category,
+          confidence: "high",
+          isTemporary: false,
+        };
+      }
+    }
+  }
+
+  // --- 2. Other strong patterns (high confidence) ---
+  const hasStrong = STRONG_PREFERENCE_PATTERNS.some((re) => re.test(lower));
+  if (hasStrong) {
+    const extracted = extractPreferenceKeyValue(message);
+    if (extracted) {
+      const normalized = normalizePreferenceValue(extracted.value, message);
+      return {
+        detected: true,
+        key: normalized.key,
+        value: normalized.value,
+        category: normalized.category,
+        confidence: "high",
+        isTemporary: false,
+      };
+    }
+  }
+
+  // --- 3. Medium patterns (medium confidence, requires valid context) ---
+  const hasMedium = MEDIUM_PREFERENCE_PATTERNS.some((re) => re.test(lower));
+  if (hasMedium) {
+    const extracted = extractPreferenceKeyValue(message);
+    if (extracted && isValidPreferenceContext(extracted.value, message)) {
+      const normalized = normalizePreferenceValue(extracted.value, message);
+      return {
+        detected: true,
+        key: normalized.key,
+        value: normalized.value,
+        category: normalized.category,
+        confidence: "medium",
+        isTemporary: false,
+      };
+    }
+  }
+
+  // --- 4. Weak patterns (low confidence, requires valid context) ---
+  const hasWeak = WEAK_PREFERENCE_PATTERNS.some((re) => re.test(lower));
+  if (hasWeak) {
+    const extracted = extractPreferenceKeyValue(message);
+    if (extracted && isValidPreferenceContext(extracted.value, message)) {
+      const normalized = normalizePreferenceValue(extracted.value, message);
+      return {
+        detected: true,
+        key: normalized.key,
+        value: normalized.value,
+        category: normalized.category,
+        confidence: "low",
+        isTemporary: false,
+      };
+    }
+  }
+
+  return empty;
+}
+
+/**
+ * Determine which preference categories are relevant to the current message.
+ * Uses entity/topic extraction from the existing infrastructure.
+ */
+function getRelevantPreferenceCategories(
+  message: string,
+  recentTopics: string[]
+): PreferenceCategory[] {
+  const lower = message.toLowerCase();
+  const categories: PreferenceCategory[] = [];
+
+  const allText = lower + " " + recentTopics.join(" ");
+
+  for (const [keyword, cats] of Object.entries(TOPIC_CATEGORY_HINTS)) {
+    if (allText.includes(keyword)) {
+      for (const cat of cats) {
+        if (!categories.includes(cat)) categories.push(cat);
+      }
+    }
+  }
+
+  // Always include communication preferences for non-trivial messages
+  // since they affect how responses are formatted.
+  if (categories.length > 0 && !categories.includes("communication")) {
+    // Only add communication if the message is about interaction style
+    if (/\b(explain|answer|response|reply|format|step|detail|help)\b/.test(lower)) {
+      categories.push("communication");
+    }
+  }
+
+  // general preferences are always potentially relevant.
+  if (categories.length === 0) {
+    categories.push("general");
+  }
+
+  return categories;
+}
+
+/**
+ * Retrieve user preferences relevant to the current message context.
+ * Returns only active preferences whose category matches the message context.
+ * Does NOT inject every stored preference — only relevant ones.
+ */
+export function getRelevantUserPreferences(
+  message: string,
+  recentTopics: string[] = []
+): UserPreference[] {
+  const relevantCategories = getRelevantPreferenceCategories(message, recentTopics);
+  const allActive = getActiveUserPreferences();
+
+  return allActive.filter((p) => relevantCategories.includes(p.category));
+}
+
+/**
+ * Check if a user message contains an explicit override of a stored preference.
+ * E.g., if the stored preference says "short answers" but the user says
+ * "Explain this deeply", the current request wins.
+ */
+export function hasCurrentRequestOverride(
+  message: string,
+  preferences: UserPreference[]
+): boolean {
+  if (preferences.length === 0) return false;
+
+  const lower = message.toLowerCase();
+
+  // Check for explicit override signals in the current message.
+  const overridePatterns: RegExp[] = [
+    /\b(explain|describe|elaborate|go\s+into\s+detail|in\s+depth|detailed|thoroughly|comprehensive)\b/i,
+    /\b(give\s+me\s+(all|everything|the\s+full|a\s+full|a\s+complete|complete))\b/i,
+    /\b(keep\s+it\s+(long|detailed|comprehensive|thorough|in\s+depth))\b/i,
+    /\bstep\s+by\s+step\b/i,
+    /\b(one\s+step\s+at\s+a\s+time)\b/i,
+    /\b(don'?t\s+(?:skip|abbreviate|shorten))\b/i,
+  ];
+
+  // If the message itself is a preference statement, don't treat it as an override
+  // of other preferences — it's a NEW preference being declared.
+  const hasPreferenceSignal =
+    STRONG_PREFERENCE_PATTERNS.some((re) => re.test(lower)) ||
+    MEDIUM_PREFERENCE_PATTERNS.some((re) => re.test(lower)) ||
+    WEAK_PREFERENCE_PATTERNS.some((re) => re.test(lower));
+  if (hasPreferenceSignal) return false;
+
+  return overridePatterns.some((re) => re.test(lower));
+}
+
+/**
+ * Build the preference context section for the system prompt.
+ * Only includes preferences relevant to the current message.
+ * Returns an empty string when no relevant preferences exist.
+ *
+ * If the current user message explicitly overrides a stored preference,
+ * the override is noted so the model follows the current request.
+ */
+export function buildPreferenceContext(
+  message: string,
+  recentTopics: string[] = [],
+  isTrivial: boolean = false
+): { section: string; isRelevant: boolean } {
+  if (isTrivial) return { section: "", isRelevant: false };
+
+  const relevant = getRelevantUserPreferences(message, recentTopics);
+  if (relevant.length === 0) return { section: "", isRelevant: false };
+
+  const override = hasCurrentRequestOverride(message, relevant);
+
+  const lines = relevant.map((p) => {
+    const prefix =
+      p.confidence === "high"
+        ? ""
+        : p.confidence === "low"
+          ? "(soft) "
+          : "";
+    return `- ${prefix}${p.key}: ${p.value}`;
+  });
+
+  let section =
+    "\n\nUser preferences (follow these when relevant, but current explicit requests always take priority):\n" +
+    lines.join("\n");
+
+  if (override) {
+    section +=
+      "\nThe user's current message appears to override one or more preferences above. Follow the current request.";
+  }
+
+  section +=
+    "\n(These are the user's stored preferences. Use them to tailor your response style and approach. " +
+    "Do not mention these preferences to the user unless they ask about them.)";
+
+  return { section, isRelevant: true };
 }

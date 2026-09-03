@@ -30,12 +30,18 @@ import {
   buildTaskContext,
   taskTitlesMatch,
   clearAllTaskContext,
+  detectUserPreference,
+  createUserPreference,
+  getActiveUserPreferences,
+  clearAllUserPreferences,
+  buildPreferenceContext,
 } from "@/lib/db";
 
 beforeEach(() => {
   clearAllMemories();
   clearAllProjectContext();
   clearAllTaskContext();
+  clearAllUserPreferences();
 });
 
 describe("Stage 3: memory conflict / update resolution", () => {
@@ -857,5 +863,302 @@ describe("Stage 8: planning & task awareness", () => {
     const ctx = buildTaskContext("I'm working on it.", [], false);
     expect(ctx.isTaskRelated).toBe(true);
     expect(ctx.section).toContain("Connect the motor driver");
+  });
+});
+
+describe("Stage 9: deeper personalization — user preferences", () => {
+  // A: explicit preference detection
+  it("A: detects explicit 'I prefer' statements as durable preferences", () => {
+    const result = detectUserPreference("I prefer short explanations.");
+    expect(result.detected).toBe(true);
+    expect(result.key).toBeTruthy();
+    expect(result.value).toBeTruthy();
+    expect(result.isTemporary).toBe(false);
+  });
+
+  // B: "from now on" preference
+  it("B: detects 'from now on' as a high-confidence durable preference", () => {
+    const result = detectUserPreference("From now on, give me one step at a time.");
+    expect(result.detected).toBe(true);
+    expect(result.confidence).toBe("high");
+    expect(result.isTemporary).toBe(false);
+  });
+
+  // C: coding preference
+  it("C: detects coding-related preferences with appropriate category", () => {
+    const result = detectUserPreference("I prefer TypeScript over JavaScript.");
+    expect(result.detected).toBe(true);
+    expect(result.category).toBe("coding");
+  });
+
+  // D: temporary request is not stored
+  it("D: temporary requests are flagged and not treated as durable preferences", () => {
+    const result = detectUserPreference("For this answer, keep it short.");
+    expect(result.detected).toBe(false);
+    expect(result.isTemporary).toBe(true);
+  });
+
+  // E: strong preference gets high confidence
+  it("E: strong explicit preference language gets high confidence", () => {
+    const result = detectUserPreference("Please always explain step by step.");
+    expect(result.detected).toBe(true);
+    expect(result.confidence).toBe("high");
+  });
+
+  // F: weaker preference gets lower confidence
+  it("F: weaker preference language gets lower confidence", () => {
+    const result = detectUserPreference("I think I might prefer concise answers.");
+    expect(result.detected).toBe(true);
+    expect(result.confidence).toBe("low");
+  });
+
+  // G: new preference replaces/deactivates old conflicting preference
+  it("G: new preference for the same key deactivates the old one", () => {
+    createUserPreference("communication", "response_style", "Step by step", "high");
+    expect(getActiveUserPreferences()).toHaveLength(1);
+
+    createUserPreference("communication", "response_style", "All commands together", "high");
+    const active = getActiveUserPreferences();
+    expect(active).toHaveLength(1);
+    expect(active[0].value).toBe("All commands together");
+
+    // Old row is inactive
+    const db = getDb();
+    const all = db.prepare("SELECT * FROM user_preference").all() as Array<{ is_active: number; value: string }>;
+    expect(all).toHaveLength(2);
+    expect(all.filter((r) => r.is_active === 0)).toHaveLength(1);
+    expect(all.find((r) => r.is_active === 0)?.value).toBe("Step by step");
+  });
+
+  // H: unrelated preference is not replaced
+  it("H: unrelated preference is untouched when a new preference is stored", () => {
+    createUserPreference("communication", "response_style", "Step by step", "high");
+    createUserPreference("coding", "language", "TypeScript", "medium");
+
+    expect(getActiveUserPreferences()).toHaveLength(2);
+
+    // Update response_style — coding/language must survive
+    createUserPreference("communication", "response_style", "Concise", "high");
+
+    const active = getActiveUserPreferences();
+    expect(active).toHaveLength(2);
+    const keys = active.map((p) => p.key);
+    expect(keys).toContain("response_style");
+    expect(keys).toContain("language");
+  });
+
+  // I: relevant preference is retrieved
+  it("I: relevant preference is retrieved for a coding message", () => {
+    createUserPreference("coding", "language", "TypeScript", "medium");
+    createUserPreference("communication", "response_style", "Step by step", "high");
+
+    const relevant = getActiveUserPreferences().filter(
+      (p) => p.category === "coding"
+    );
+    expect(relevant.length).toBe(1);
+    expect(relevant[0].key).toBe("language");
+  });
+
+  // J: unrelated preference is excluded
+  it("J: unrelated preference is excluded from retrieval for a specific topic", () => {
+    createUserPreference("content", "writing_style", "Formal tone", "medium");
+    createUserPreference("coding", "language", "TypeScript", "medium");
+
+    // For a coding-related message, content preferences should not dominate
+    const result = buildPreferenceContext("Help me fix this React error.", [], false);
+    expect(result.section).toContain("language");
+    expect(result.section).not.toContain("writing_style");
+  });
+
+  // K: current explicit request overrides stored preference
+  it("K: current explicit request is flagged as overriding stored preferences", () => {
+    createUserPreference("communication", "explanation_depth", "Keep it short", "high");
+
+    // The override detection should trigger for "Explain this deeply"
+    const result = buildPreferenceContext("Explain this deeply.", [], false);
+    expect(result.section).toContain("override");
+  });
+
+  // L: preference persists through normal DB retrieval
+  it("L: preference persists and is retrievable via getActiveUserPreferences", () => {
+    createUserPreference("workflow", "pace", "One step at a time", "high");
+
+    const active = getActiveUserPreferences();
+    expect(active).toHaveLength(1);
+    expect(active[0].key).toBe("pace");
+    expect(active[0].value).toBe("One step at a time");
+    expect(active[0].is_active).toBe(1);
+  });
+
+  // M: inactive preference is not treated as active
+  it("M: deactivated preference does not appear in active retrieval", () => {
+    const pref = createUserPreference("communication", "response_style", "Verbose", "medium");
+    expect(getActiveUserPreferences()).toHaveLength(1);
+
+    // Manually deactivate
+    const db = getDb();
+    db.prepare("UPDATE user_preference SET is_active = 0 WHERE id = ?").run(pref.id);
+
+    expect(getActiveUserPreferences()).toHaveLength(0);
+    // Still exists in all prefs
+    const db2 = getDb();
+    const all = db2.prepare("SELECT * FROM user_preference").all();
+    expect(all).toHaveLength(1);
+  });
+
+  // N: preference does not appear in normal memory retrieval/listing
+  it("N: user preferences never appear in memory retrieval or listing", () => {
+    createUserPreference("communication", "response_style", "Step by step", "high");
+
+    // Memory system is completely separate
+    expect(getAllMemories()).toHaveLength(0);
+    expect(getAllMemoriesIncludingArchived()).toHaveLength(0);
+    expect(getRelevantMemories("response style").length).toBe(0);
+
+    // Creating a memory doesn't create additional preferences
+    const prefsBefore = getActiveUserPreferences().length;
+    createMemory("My name is Alice.", "personal");
+    expect(getActiveUserPreferences()).toHaveLength(prefsBefore);
+
+    // Memories are still separate
+    expect(getAllMemories()).toHaveLength(1);
+  });
+
+  // O: task statement does not create a preference
+  it("O: task statements do not create user preferences", () => {
+    const task = detectTaskStatement("I need to connect the motor driver.");
+    expect(task.kind).toBe("create");
+
+    const prefResult = detectUserPreference("I need to connect the motor driver.");
+    expect(prefResult.detected).toBe(false);
+  });
+
+  // P: project statement does not create a preference
+  it("P: project introduction does not create a user preference", () => {
+    expect(detectProjectIntroduction("I'm building an ESP32 car.")).toBe(true);
+
+    const prefResult = detectUserPreference("I'm building an ESP32 car.");
+    expect(prefResult.detected).toBe(false);
+  });
+
+  // Q: tone/context behavior remains intact
+  it("Q: tone detection is independent of preference detection", () => {
+    const tone = buildToneContext("I finally finished my project!");
+    expect(tone.tone).toBe("positive");
+    expect(tone.hasTone).toBe(true);
+
+    // Preference detection doesn't interfere
+    const pref = detectUserPreference("I finally finished my project!");
+    expect(pref.detected).toBe(false);
+  });
+
+  // R: multiple independent preferences coexist correctly
+  it("R: multiple independent preferences across categories coexist", () => {
+    createUserPreference("communication", "response_style", "Step by step", "high");
+    createUserPreference("coding", "language", "TypeScript", "medium");
+    createUserPreference("workflow", "pace", "Slow and thorough", "low");
+    createUserPreference("content", "writing_style", "Formal", "medium");
+
+    const active = getActiveUserPreferences();
+    expect(active).toHaveLength(4);
+
+    const keys = active.map((p) => p.key).sort();
+    expect(keys).toEqual(["language", "pace", "response_style", "writing_style"]);
+  });
+
+  // --- Issue 1 & 2 regression tests ---
+
+  it("R2: 'From now on, give me one step at a time' is a durable preference", () => {
+    const result = detectUserPreference("From now on, give me one step at a time.");
+    expect(result.detected).toBe(true);
+    expect(result.confidence).toBe("high");
+    expect(result.isTemporary).toBe(false);
+    expect(result.key).toBe("instruction_delivery");
+    expect(result.value).toBe("Step by step");
+  });
+
+  it("R3: 'Actually, give me all the commands together' updates the SAME preference concept", () => {
+    // Store the first preference
+    createUserPreference("communication", "instruction_delivery", "Step by step", "high");
+    expect(getActiveUserPreferences()).toHaveLength(1);
+    expect(getActiveUserPreferences()[0].key).toBe("instruction_delivery");
+
+    // Detect the second preference
+    const result = detectUserPreference("Actually, give me all the commands together.");
+    expect(result.detected).toBe(true);
+    expect(result.key).toBe("instruction_delivery");
+    expect(result.value).toBe("All at once");
+
+    // Store it — should deactivate the old one
+    createUserPreference("communication", result.key!, result.value!, result.confidence);
+    const active = getActiveUserPreferences();
+    expect(active).toHaveLength(1);
+    expect(active[0].value).toBe("All at once");
+
+    // Old row is inactive
+    const db = getDb();
+    const all = db.prepare("SELECT * FROM user_preference").all() as Array<{ is_active: number; value: string }>;
+    expect(all).toHaveLength(2);
+    expect(all.filter((r) => r.is_active === 0)).toHaveLength(1);
+  });
+
+  it("R4: 'I want to fix this bug' is NOT a preference", () => {
+    const result = detectUserPreference("I want to fix this bug.");
+    expect(result.detected).toBe(false);
+  });
+
+  it("R5: 'I want to go to the gym' is NOT a preference", () => {
+    const result = detectUserPreference("I want to go to the gym.");
+    expect(result.detected).toBe(false);
+  });
+
+  it("R6: 'I usually work at night' is NOT a preference", () => {
+    const result = detectUserPreference("I usually work at night.");
+    expect(result.detected).toBe(false);
+  });
+
+  it("R7: 'I always go to the gym in the morning' is NOT a preference", () => {
+    const result = detectUserPreference("I always go to the gym in the morning.");
+    expect(result.detected).toBe(false);
+  });
+
+  it("R8: 'I prefer short explanations' is a durable communication preference", () => {
+    const result = detectUserPreference("I prefer short explanations.");
+    expect(result.detected).toBe(true);
+    expect(result.category).toBe("communication");
+    expect(result.key).toBe("response_length");
+    expect(result.value).toBe("Concise");
+  });
+
+  it("R9: 'I want you to explain code step by step' is a durable coding/communication preference", () => {
+    const result = detectUserPreference("I want you to explain code step by step.");
+    expect(result.detected).toBe(true);
+    expect(result.confidence).toBe("high");
+    expect(result.key).toBe("instruction_delivery");
+    expect(result.value).toBe("Step by step");
+  });
+
+  it("R10: 'I prefer TypeScript over JavaScript' is a durable coding preference", () => {
+    const result = detectUserPreference("I prefer TypeScript over JavaScript.");
+    expect(result.detected).toBe(true);
+    expect(result.category).toBe("coding");
+    expect(result.key).toBe("preferred_language");
+    expect(result.value).toBe("TypeScript");
+  });
+
+  it("R11: relevant preference retrieval works after normalization", () => {
+    // Store normalized preferences
+    createUserPreference("communication", "instruction_delivery", "Step by step", "high");
+    createUserPreference("coding", "preferred_language", "TypeScript", "medium");
+
+    // For a coding message, should retrieve coding preference
+    const codingResult = buildPreferenceContext("Help me fix this React error.", [], false);
+    expect(codingResult.section).toContain("preferred_language");
+    expect(codingResult.section).toContain("TypeScript");
+
+    // For a communication message, should retrieve communication preference
+    const commResult = buildPreferenceContext("Explain how this works.", [], false);
+    expect(commResult.section).toContain("instruction_delivery");
+    expect(commResult.section).toContain("Step by step");
   });
 });

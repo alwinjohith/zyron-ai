@@ -23,6 +23,9 @@ import {
   markActiveTaskInProgress,
   completeActiveTask,
   buildTaskContext,
+  detectUserPreference,
+  createUserPreference,
+  buildPreferenceContext,
   MAX_RELEVANT_MEMORIES,
 } from "@/lib/db";
 import type {
@@ -487,6 +490,23 @@ export async function POST(request: Request) {
       console.log("[Task] Completed active task");
     }
 
+    // --- Stage 9: detect & persist durable user preferences ---
+    // Deterministic, rule-based. Only explicit preference statements create or
+    // update user_preference rows. Temporary requests and ordinary conversation
+    // are never turned into preferences.
+    const prefDetection = detectUserPreference(userText);
+    if (prefDetection.detected && !prefDetection.isTemporary && prefDetection.key && prefDetection.value && prefDetection.category) {
+      createUserPreference(
+        prefDetection.category,
+        prefDetection.key,
+        prefDetection.value,
+        prefDetection.confidence
+      );
+      console.log(
+        `[Preference] Stored: ${prefDetection.category}/${prefDetection.key} = "${prefDetection.value}" (${prefDetection.confidence})`
+      );
+    }
+
     // --- Short-term (per-request) conversation context ---
     // Derives the active topic and any pronoun/follow-up hints for the latest
     // message. This is deterministic, rule-based, and never persisted.
@@ -519,6 +539,16 @@ export async function POST(request: Request) {
     );
     const taskSection = taskCtx.section;
 
+    // --- Stage 9: user preference context ---
+    // Only relevant preferences are injected. Current explicit requests
+    // always override stored preferences.
+    const prefCtx = buildPreferenceContext(
+      userText,
+      shortTerm.activeTopics,
+      shortTerm.isTrivial
+    );
+    const preferenceSection = prefCtx.section;
+
     // Retrieve only the memories relevant to the current user message.
     // Trivial conversational filler ("hi", "how are you?", "okay") is skipped
     // entirely so it never triggers a broad long-term memory scan.
@@ -538,8 +568,8 @@ export async function POST(request: Request) {
     const ollamaMessages = [
       {
         role: "system",
-        content:
-          SYSTEM_PROMPT + memoryPromptSection + shortTermSection + toneSection + projectSection + taskSection,
+          content:
+          SYSTEM_PROMPT + memoryPromptSection + shortTermSection + toneSection + projectSection + taskSection + preferenceSection,
       },
       ...messages.map((m: { role: string; content: string }) => ({
         role: m.role,

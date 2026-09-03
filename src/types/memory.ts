@@ -56,3 +56,42 @@ export interface ToneContext {
   // True when a tone directive should be injected into the prompt.
   hasTone: boolean;
 }
+
+// ============================================================
+// STAGE 9: USER PREFERENCES
+// ============================================================
+
+/** Confidence level for a detected user preference. */
+export type PreferenceConfidence = "high" | "medium" | "low";
+
+/** Category of a user preference (subset of memory categories). */
+export type PreferenceCategory =
+  | "communication"
+  | "coding"
+  | "workflow"
+  | "technology"
+  | "content"
+  | "general";
+
+/** A stored user preference row. */
+export interface UserPreference {
+  id: number;
+  category: PreferenceCategory;
+  key: string;
+  value: string;
+  confidence: PreferenceConfidence;
+  is_active: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Result of deterministic preference detection on a user message. */
+export interface PreferenceDetectionResult {
+  detected: boolean;
+  key: string | null;
+  value: string | null;
+  category: PreferenceCategory | null;
+  confidence: PreferenceConfidence;
+  /** True when the message is a temporary request, NOT a durable preference. */
+  isTemporary: boolean;
+}
