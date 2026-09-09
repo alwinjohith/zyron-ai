@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, type FormEvent } from "react";
 import ChatMessage from "@/components/ChatMessage";
 import MemoryPanel from "@/components/MemoryPanel";
 import type { Message } from "@/types/chat";
+import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
 
 // Generate a unique ID for each message
 function generateId(): string {
@@ -20,6 +21,23 @@ export default function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // Voice input — browser-native speech recognition wired to the composer.
+  const {
+    isSupported: isRecognitionSupported,
+    isListening,
+    transcript,
+    interimTranscript,
+    error: recognitionError,
+    start: startVoiceRecognition,
+    stop: stopVoiceRecognition,
+    reset: resetVoiceRecognition,
+  } = useSpeechRecognition();
+
+  // Text that was already in the composer when listening started, plus a
+  // transient user-friendly voice error (auto-dismissed after a few seconds).
+  const [voiceError, setVoiceError] = useState<string | null>(recognitionError);
+  const voicePrefixRef = useRef("");
+
   // Scroll to the latest message whenever messages or streaming text changes
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -29,9 +47,34 @@ export default function ChatPage() {
     inputRef.current?.focus();
   }, []);
 
+  // While listening, mirror the live voice draft into the composer without
+  // wiping out whatever the user had already typed.
+  useEffect(() => {
+    if (!isListening) return;
+    const voice = [transcript, interimTranscript].filter(Boolean).join(" ");
+    const prefix = voicePrefixRef.current.trim();
+    setInput(prefix ? (voice ? `${prefix} ${voice}` : prefix) : voice);
+  }, [isListening, transcript, interimTranscript]);
+
+  // Keep the displayed voice error in sync with the latest recognition error
+  // (guarded state adjustment during render — the documented React pattern).
+  if (recognitionError && voiceError !== recognitionError) {
+    setVoiceError(recognitionError);
+  }
+
+  // Auto-dismiss the voice error after 5 seconds so it never lingers.
+  useEffect(() => {
+    if (!recognitionError) return;
+    const timer = setTimeout(() => setVoiceError(null), 5000);
+    return () => clearTimeout(timer);
+  }, [recognitionError]);
+
   // Send a message to the AI
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
+
+    // Stop any active voice session before sending its draft.
+    if (isListening) stopVoiceRecognition();
 
     const trimmed = input.trim();
     if (!trimmed || isLoading) return;
@@ -122,6 +165,21 @@ export default function ChatPage() {
   function fillSuggestion(text: string) {
     setInput(text);
     inputRef.current?.focus();
+  }
+
+  // Toggle voice recognition from the composer.
+  function handleMicClick() {
+    if (isListening) {
+      stopVoiceRecognition();
+      return;
+    }
+    if (isLoading) return;
+    // Remember what the user typed so the voice draft appends to it, and
+    // clear any previous voice error before starting a fresh session.
+    voicePrefixRef.current = input;
+    setVoiceError(null);
+    resetVoiceRecognition();
+    startVoiceRecognition();
   }
 
   return (
@@ -228,27 +286,80 @@ export default function ChatPage() {
 
       {/* Input area */}
       <div className="border-t border-white/10 bg-black/30 px-4 py-3 backdrop-blur-xl">
-        <form
-          onSubmit={handleSubmit}
-          className="mx-auto flex max-w-2xl gap-2"
-        >
-          <input
-            ref={inputRef}
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Type your message..."
-            disabled={isLoading}
-            className="flex-1 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-stone-100 placeholder-stone-500 focus:border-orange-500/40 focus:outline-none focus:ring-2 focus:ring-orange-500/60 disabled:opacity-50"
-          />
-          <button
-            type="submit"
-            disabled={isLoading || !input.trim()}
-            className="rounded-2xl bg-gradient-to-r from-orange-500 to-red-600 px-6 py-3 text-sm font-medium text-white transition hover:brightness-110 active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-orange-500/70 disabled:cursor-not-allowed disabled:opacity-50"
+        <div className="mx-auto max-w-2xl">
+          {isListening && (
+            <div
+              role="status"
+              className="mb-2 flex items-center justify-center gap-2 text-xs font-medium text-orange-300"
+            >
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-orange-500 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-orange-500" />
+              </span>
+              Listening… speak now, then stop
+            </div>
+          )}
+
+          {voiceError && (
+            <div
+              role="status"
+              className="mb-2 flex items-center justify-center gap-2 text-xs text-red-300"
+            >
+              <span>⚠️</span>
+              <span>{voiceError}</span>
+            </div>
+          )}
+
+          <form
+            onSubmit={handleSubmit}
+            className="mx-auto flex max-w-2xl gap-2"
           >
-            {isLoading ? "Sending..." : "Send"}
-          </button>
-        </form>
+            {isRecognitionSupported && (
+              <button
+                type="button"
+                onClick={handleMicClick}
+                disabled={isLoading}
+                aria-label={isListening ? "Stop listening" : "Speak your message"}
+                aria-pressed={isListening}
+                title={isListening ? "Stop listening" : "Speak your message"}
+                className={
+                  isListening
+                    ? "flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-2xl bg-gradient-to-r from-orange-500 to-red-600 text-white shadow-[0_0_18px_rgb(255_122_26_/_0.5)] animate-pulse transition focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70 disabled:opacity-50"
+                    : "flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-2xl border border-white/10 bg-white/5 text-stone-300 transition hover:border-orange-500/40 hover:bg-white/10 hover:text-orange-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70 disabled:opacity-50"
+                }
+              >
+                {isListening ? (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="6" y="6" width="12" height="12" rx="2" />
+                  </svg>
+                ) : (
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                    <line x1="12" y1="19" x2="12" y2="22" />
+                  </svg>
+                )}
+              </button>
+            )}
+
+            <input
+              ref={inputRef}
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="Type your message..."
+              disabled={isLoading}
+              className="flex-1 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-stone-100 placeholder-stone-500 focus:border-orange-500/40 focus:outline-none focus:ring-2 focus:ring-orange-500/60 disabled:opacity-50"
+            />
+            <button
+              type="submit"
+              disabled={isLoading || !input.trim()}
+              className="rounded-2xl bg-gradient-to-r from-orange-500 to-red-600 px-6 py-3 text-sm font-medium text-white transition hover:brightness-110 active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-orange-500/70 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {isLoading ? "Sending..." : "Send"}
+            </button>
+          </form>
+        </div>
       </div>
 
       <MemoryPanel isOpen={isMemoryOpen} onClose={() => setIsMemoryOpen(false)} />
