@@ -11,6 +11,7 @@ import {
   MAX_RELEVANT_MEMORIES,
   buildShortTermContext,
   isTrivialMessage,
+  isGenuineFollowUp,
   categorizeMemory,
   findDuplicateMemory,
   classifyUserTone,
@@ -405,6 +406,164 @@ describe("Stage 5: follow-up retrieval coupling", () => {
     // No follow-up topic => the fallback path must not fabricate a match.
     const relevant = getRelevantMemories("It is good.", []);
     expect(relevant.length).toBe(0);
+  });
+});
+
+describe("Stage 10 Part 2: follow-up topic leakage", () => {
+  it("A: previous technical topic + unrelated weather question retrieves nothing", () => {
+    createMemory("I'm building a car using ESP32.", "projects");
+    const history = [{ role: "user", content: "I'm building an ESP32 car." }];
+
+    const ctx = buildShortTermContext("What's the weather?", history);
+    expect(ctx.followUpTopic).toBeNull();
+
+    const relevant = getRelevantMemories(
+      "What's the weather?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      ctx.followUpTopic
+    );
+    expect(relevant.length).toBe(0);
+  });
+
+  it("B: previous technical topic + unrelated time question retrieves nothing", () => {
+    createMemory("My favorite programming language is Java.", "preferences");
+    const history = [{ role: "user", content: "I'm working on Java." }];
+
+    const ctx = buildShortTermContext("What time is it?", history);
+    expect(ctx.followUpTopic).toBeNull();
+
+    const relevant = getRelevantMemories(
+      "What time is it?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      ctx.followUpTopic
+    );
+    expect(relevant.length).toBe(0);
+  });
+
+  it("C: legitimate anaphoric follow-up keeps the Java topic available", () => {
+    createMemory("I prefer Java.", "preferences");
+    const history = [{ role: "user", content: "Java is better for this project." }];
+
+    const ctx = buildShortTermContext("Why is it better?", history);
+    expect(ctx.followUpTopic).toBeTruthy();
+
+    const relevant = getRelevantMemories(
+      "Why is it better?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      ctx.followUpTopic
+    );
+    expect(relevant.some((m) => m.content.toLowerCase().includes("java"))).toBe(true);
+  });
+
+  it("D: legitimate 'it' follow-up keeps the ESP32 context available", () => {
+    createMemory("I'm building a car using ESP32.", "projects");
+    const history = [{ role: "user", content: "I'm building an ESP32 car." }];
+
+    const ctx = buildShortTermContext("How do I fix it?", history);
+    expect(ctx.followUpTopic).toBeTruthy();
+
+    const relevant = getRelevantMemories(
+      "How do I fix it?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      ctx.followUpTopic
+    );
+    expect(relevant.some((m) => m.content.toLowerCase().includes("esp32"))).toBe(true);
+  });
+
+  it("E: project and task guards still reject independent questions", () => {
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+    createTaskContext("Connect the motor driver", "planned");
+
+    const projectCtx = buildProjectContext("What's the weather?", ["esp32"], false);
+    expect(projectCtx.isFollowUp).toBe(false);
+
+    const taskCtx = buildTaskContext("What's the weather?", ["esp32"], false);
+    expect(taskCtx.isTaskRelated).toBe(false);
+  });
+
+  it("F: an independent general-knowledge question inherits no topic", () => {
+    createMemory("I prefer Java.", "preferences");
+    const history = [{ role: "user", content: "I prefer Java." }];
+
+    const ctx = buildShortTermContext("Who is the president?", history);
+    expect(ctx.followUpTopic).toBeNull();
+
+    const relevant = getRelevantMemories(
+      "Who is the president?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      ctx.followUpTopic
+    );
+    expect(relevant.length).toBe(0);
+  });
+
+  it("G: trivial messages still behave as before (no follow-up, no retrieval)", () => {
+    createMemory("I'm building a car using ESP32.", "projects");
+    const history = [{ role: "user", content: "I'm building an ESP32 car." }];
+
+    const ctx = buildShortTermContext("How are you?", history);
+    expect(ctx.isTrivial).toBe(true);
+    expect(ctx.followUpTopic).toBeNull();
+
+    const relevant = getRelevantMemories(
+      "How are you?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      ctx.followUpTopic
+    );
+    expect(relevant.length).toBe(0);
+  });
+
+  it("H: genuinely topical follow-ups still retrieve the relevant memory", () => {
+    createMemory("I'm building a car using ESP32.", "projects");
+    const history = [{ role: "user", content: "I'm building an ESP32 car." }];
+
+    const ctx = buildShortTermContext("What sensor should I use?", history);
+    expect(ctx.followUpTopic).toContain("esp32");
+
+    const relevant = getRelevantMemories(
+      "What sensor should I use?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      ctx.followUpTopic
+    );
+    expect(relevant.some((m) => m.content.toLowerCase().includes("esp32"))).toBe(true);
+  });
+
+  it("defense in depth: a stray followUpTopic cannot force weather retrieval", () => {
+    createMemory("I'm building a car using ESP32.", "projects");
+    const history = [{ role: "user", content: "I'm building an ESP32 car." }];
+
+    // Even if upstream wrongly resolved a follow-up topic, getRelevantMemories
+    // must re-check and reject the unrelated bare question.
+    const relevant = getRelevantMemories(
+      "What's the weather?",
+      history,
+      MAX_RELEVANT_MEMORIES,
+      "esp32"
+    );
+    expect(relevant.length).toBe(0);
+  });
+
+  it("shared helper is consistent across the required cases", () => {
+    expect(isGenuineFollowUp("What's the weather?", ["esp32"])).toBe(false);
+    expect(isGenuineFollowUp("What time is it?", ["java"])).toBe(false);
+    expect(isGenuineFollowUp("Who is the president?", ["java"])).toBe(false);
+    expect(isGenuineFollowUp("Why is it better?", ["java"])).toBe(true);
+    expect(isGenuineFollowUp("How do I fix it?", ["esp32"])).toBe(true);
+    expect(isGenuineFollowUp("What about its memory system?", ["zyron"])).toBe(true);
+    expect(isGenuineFollowUp("What sensor should I use?", ["esp32"])).toBe(true);
+    expect(isGenuineFollowUp("What should I do next?", ["esp32"])).toBe(true);
+    // Bare short statements are not attached eagerly.
+    expect(isGenuineFollowUp("Sounds good.", ["esp32"])).toBe(false);
+    expect(isGenuineFollowUp("ok", ["esp32"])).toBe(false);
+    expect(isGenuineFollowUp("Hi", ["esp32"])).toBe(false);
+    // No recent topic => no follow-up, even for anaphora.
+    expect(isGenuineFollowUp("Why is it better?", [])).toBe(false);
   });
 });
 

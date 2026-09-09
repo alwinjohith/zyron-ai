@@ -332,4 +332,46 @@ describe("POST /api/chat route integration (Stage 10 Part 1)", () => {
     expect(system).toContain("working on the motor driver");
     expect(system).toContain("--- CONVERSATION (short-term context) ---");
   });
+
+  it("prevents an unrelated bare question from retrieving the previous topic", async () => {
+    createMemory("I'm building a car using ESP32.", "projects");
+    createProjectContext("ESP32 car", "I'm building an ESP32 car.");
+
+    const fetchMock = vi.fn(
+      async (_url: unknown, init: { body?: string } | undefined) => {
+        void init;
+        return ollamaStreamResponse("ok");
+      }
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { POST } = await import("@/app/api/chat/route");
+
+    const response = await POST(
+      chatRequest([
+        { role: "user", content: "I'm building an ESP32 car." },
+        { role: "user", content: "What's the weather?" },
+      ])
+    );
+
+    expect(response.status).toBe(200);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[0][1] as { body?: string }).body ?? "{}"
+    );
+    const system = body.messages[0].content;
+
+    // The unrelated weather question must NOT inject the ESP32 memory.
+    expect(system).not.toContain(
+      "--- MEMORY (supporting facts about the user) ---"
+    );
+    expect(system).not.toContain("The user is building a car using ESP32.");
+
+    // Stage 7 persistent project context is still shown, but the weather
+    // question is NOT labeled a project follow-up.
+    expect(system).toContain("--- PROJECT (active project context) ---");
+    expect(system).toContain("ESP32 car");
+    expect(system).not.toContain(
+      "This message appears to be a follow-up about the active project."
+    );
+  });
 });

@@ -1354,14 +1354,13 @@ export function getRelevantMemories(
   // from "this message is just a reference to the prior topic".
   const ownEntities = extractEntities(message);
 
-  // A genuine follow-up continues the conversation: the message carries no
-  // topic entity of its own, but a reliable prior topic was resolved. This is
-  // conservative — trivial filler and messages with their own topic entity are
-  // never treated as a follow-up.
+  // A genuine follow-up continues the conversation. Re-checking with the shared
+  // rule here (not just trusting followUpTopic) keeps unrelated bare questions
+  // — weather, time, "who is the president?" — from ever retrieving the
+  // previous topic even if a followUpTopic was resolved for them upstream.
   const isFollowUp =
     Boolean(followUpTopic) &&
-    ownEntities.length === 0 &&
-    !isTrivialMessage(message);
+    isGenuineFollowUp(message, qctx.recentTopics, { ownEntities });
 
   // Don't inject memories for general knowledge questions, greetings, or
   // other non-personal messages — UNLESS this is a genuine follow-up, which
@@ -1503,6 +1502,75 @@ export function isTrivialMessage(
 }
 
 /**
+ * Deterministically decide whether a message is a GENUINE continuation of the
+ * most recent conversation topic.
+ *
+ * This is the single shared follow-up rule. Short-term context, memory
+ * retrieval, and the project/task follow-up guards all use it so there is one
+ * consistent notion of "this message is still about the previous topic".
+ *
+ * A message is a genuine follow-up when ALL of these hold:
+ * - there IS a recent topic to continue;
+ * - the message is not trivial filler;
+ * - the message is not a self-contained question (general knowledge like
+ *   "What's the weather?", "What time is it?", "Who is the president?") or a
+ *   greeting — those never inherit the previous topic;
+ * - AND there is evidence the message points at the recent topic:
+ *     - anaphora: a referencing pronoun ("it", "that", "this", ...) in a
+ *       message with no topic entity of its own, e.g. "Why is it better?",
+ *       "How do I fix it?", "What about its memory system?"; OR
+ *     - a bare question / explicit advice request (no own entities) that is
+ *       still substantively attached, e.g. "What sensor should I use?",
+ *       "What should I do next?".
+ *
+ * Plain short statements ("ok", "sounds good", "I agree") are NOT attached:
+ * they do not provide enough evidence to be treated as a follow-up.
+ */
+export function isGenuineFollowUp(
+  message: string,
+  recentTopics: string[] = [],
+  options: { isTrivial?: boolean; ownEntities?: string[] } = {}
+): boolean {
+  if (recentTopics.length === 0) return false;
+
+  const ownEntities = options.ownEntities ?? extractEntities(message);
+  const isTrivial =
+    options.isTrivial ??
+    isTrivialMessage(
+      message,
+      ownEntities,
+      extractTopicTokens(message).filter((t) => !GENERIC_TOPIC_WORDS.has(t))
+    );
+  if (isTrivial) return false;
+
+  // Self-contained messages never inherit the previous topic.
+  const intent = classifyUserIntent(message);
+  if (intent === "general_knowledge" || intent === "greeting") return false;
+
+  const lower = message.toLowerCase().trim();
+  const usesPronoun = REFERENCING_PRONOUNS.some((p) =>
+    new RegExp(`\\b${p}\\b`, "i").test(lower)
+  );
+  const isBare = ownEntities.length === 0;
+
+  // Anaphora in a message with no topic of its own points at the recent topic.
+  if (usesPronoun && isBare) return true;
+
+  // A bare message continues the topic only when it is itself a question or an
+  // explicit request for advice. Bare statements are deliberately NOT attached.
+  if (isBare) {
+    const isQuestion =
+      lower.endsWith("?") ||
+      /^(what|which|who|whom|whose|when|where|why|how|does|do|is|are|can|could|should|would|did|will)\b/.test(
+        lower
+      );
+    if (isQuestion || intent === "request_advice") return true;
+  }
+
+  return false;
+}
+
+/**
  * Build the short-term conversation context for the current message.
  *
  * Deterministic, rule-based, never persisted. Resolves:
@@ -1528,23 +1596,24 @@ export function buildShortTermContext(
   const usesPronoun = REFERENCING_PRONOUNS.some((p) =>
     new RegExp(`\\b${p}\\b`, "i").test(message)
   );
-  // "Bare" = the message introduces no topic entities of its own (no language,
-  // proper noun, tech, or academic term). Ordinary words such as "sensor" or
-  // "better" are not topic entities, so a follow-up like "What sensor should I
-  // use?" is still recognized as continuing the recent topic.
-  const isBare = ownEntities.length === 0;
 
-  // Follow-up: bare message (pronoun or no own topic) that continues the
-  // conversation. Attach it to the most recent prior topic.
-  let followUpTopic: string | null = null;
-  if (!isTrivial && recentTopics.length > 0 && (usesPronoun || isBare)) {
-    followUpTopic = recentTopics[recentTopics.length - 1];
-  }
+  // A follow-up is only ever attached when the shared rule confirms the message
+  // genuinely continues the most recent topic. Self-contained general-knowledge
+  // questions ("What's the weather?"), greetings, and trivial filler never get
+  // a follow-up topic, so they cannot leak the previous topic into retrieval.
+  const isFollowUp = isGenuineFollowUp(message, recentTopics, {
+    isTrivial,
+    ownEntities,
+  });
 
-  // Pronoun hints only with reasonable confidence: a referencing pronoun in a
-  // bare message, and a definite prior topic to point at.
+  const followUpTopic: string | null = isFollowUp
+    ? recentTopics[recentTopics.length - 1]
+    : null;
+
+  // Pronoun hints only with reasonable confidence: the message is a genuine
+  // follow-up, uses a referencing pronoun, and there is a definite prior topic.
   const pronounHints: string[] = [];
-  if (usesPronoun && isBare && recentTopics.length > 0) {
+  if (isFollowUp && usesPronoun) {
     pronounHints.push(...recentTopics);
   }
 
@@ -1816,9 +1885,21 @@ function isProjectFollowUp(
     return false;
   }
 
-  // Bare message (no entities of its own). Only attach when the project is
-  // specific enough to anchor on and the message is substantive, and it is not
-  // an unrelated question (general-knowledge/greeting already excluded above).
+  // Bare message (no entities of its own). First apply the shared genuine
+  // follow-up rule: a bare question, advice request, or anaphoric message
+  // continues the recent conversation topic. Otherwise, only attach when the
+  // project itself is specific enough to anchor on and the message is
+  // substantive — and never for unrelated questions (general-knowledge/
+  // greeting already excluded above).
+  if (
+    isGenuineFollowUp(message, recentTopics, {
+      isTrivial,
+      ownEntities,
+    })
+  ) {
+    return true;
+  }
+
   const nonGenericProjectWords = projectWords.filter(
     (w) => !GENERIC_TOPIC_WORDS.has(w) && !STOPWORDS.has(w)
   );
@@ -2282,8 +2363,17 @@ function isTaskFollowUp(
 
   if (overlapsTask) return true;
   if (explicitPronoun) return true;
-  // A bare question right after task-related conversation is a follow-up.
-  if (recentEvidence && ownEntities.length === 0) return true;
+  // A bare question right after task-related conversation is a follow-up,
+  // judged by the same shared genuine-follow-up rule used everywhere else.
+  if (
+    recentEvidence &&
+    isGenuineFollowUp(message, recentTopics, {
+      isTrivial,
+      ownEntities,
+    })
+  ) {
+    return true;
+  }
 
   return false;
 }
