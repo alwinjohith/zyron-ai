@@ -188,28 +188,29 @@ export default function MemoryPanel({ isOpen, onClose }: MemoryPanelProps) {
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex">
+    <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-stretch sm:justify-end">
       {/* Backdrop - click to close */}
-      <div className="absolute inset-0 bg-black/30" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
 
-      {/* Panel */}
-      <div className="ml-auto w-full max-w-sm bg-white dark:bg-zinc-900 shadow-xl flex flex-col relative">
+      {/* Panel - bottom sheet on mobile, right drawer on desktop */}
+      <div className="relative flex h-[85vh] w-full flex-col overflow-hidden rounded-t-3xl border-t border-white/10 bg-[#100a08]/95 shadow-2xl animate-[fade-up_0.25s_ease-out] sm:h-full sm:max-w-sm sm:rounded-none sm:border-l sm:border-t-0">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-200 dark:border-zinc-700">
-          <div className="flex items-center gap-2">
-            <span className="text-lg">🧠</span>
-            <h2 className="font-semibold text-zinc-900 dark:text-zinc-100">
-              Memory
-            </h2>
-            <span className="text-xs bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300 px-2 py-0.5 rounded-full">
+        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+          <div className="flex items-center gap-2.5">
+            <span className="flex h-7 w-7 items-center justify-center rounded-full bg-gradient-to-br from-orange-400 via-orange-600 to-red-700 text-xs ring-1 ring-white/20">
+              🧠
+            </span>
+            <h2 className="font-semibold text-stone-100">Memory</h2>
+            <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-xs text-stone-300">
               {memories.length}
             </span>
           </div>
           <button
             onClick={onClose}
-            className="p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded"
+            aria-label="Close memory panel"
+            className="rounded-lg p-1.5 text-stone-400 transition-colors hover:bg-white/10 hover:text-stone-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70"
           >
-            <svg className="w-5 h-5 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
@@ -218,22 +219,20 @@ export default function MemoryPanel({ isOpen, onClose }: MemoryPanelProps) {
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-4">
           {error && (
-            <div className="mb-3 p-2 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-sm rounded">
+            <div className="mb-3 rounded-lg border border-red-500/30 bg-red-500/10 p-2 text-sm text-red-300">
               {error}
             </div>
           )}
 
           {isLoading ? (
-            <div className="text-center py-8 text-zinc-500 dark:text-zinc-400">
+            <div className="py-8 text-center text-stone-500">
               Loading memories...
             </div>
           ) : memories.length === 0 ? (
-            <div className="text-center py-8">
-              <div className="text-3xl mb-2">💭</div>
-              <p className="text-zinc-500 dark:text-zinc-400 text-sm">
-                No memories stored yet.
-              </p>
-              <p className="text-zinc-400 dark:text-zinc-500 text-xs mt-1">
+            <div className="py-10 text-center">
+              <div className="mb-3 text-3xl">💭</div>
+              <p className="text-sm text-stone-300">No memories stored yet.</p>
+              <p className="mt-1 text-xs text-stone-500">
                 Ask me to remember something in the chat!
               </p>
             </div>
@@ -244,14 +243,14 @@ export default function MemoryPanel({ isOpen, onClose }: MemoryPanelProps) {
                 if (categoryMemories.length === 0) return null;
                 return (
                   <div key={cat}>
-                    <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-2">
+                    <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-widest text-orange-200/70">
                       {CATEGORY_LABELS[cat]}
                     </h3>
                     <div className="space-y-2">
                       {categoryMemories.map((memory) => (
                         <div
                           key={memory.id}
-                          className="group p-3 bg-zinc-50 dark:bg-zinc-800 rounded-lg border border-zinc-200 dark:border-zinc-700"
+                          className="group rounded-xl border border-white/10 bg-white/[0.04] p-3 transition-colors hover:border-white/20"
                         >
                           {editingId === memory.id ? (
                             /* Edit mode */
@@ -259,7 +258,7 @@ export default function MemoryPanel({ isOpen, onClose }: MemoryPanelProps) {
                               <textarea
                                 value={editContent}
                                 onChange={(e) => setEditContent(e.target.value)}
-                                className="w-full px-2 py-1 text-sm bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-600 rounded text-zinc-800 dark:text-zinc-200 resize-none"
+                                className="w-full resize-none rounded-lg border border-white/10 bg-black/30 px-2 py-1 text-sm text-stone-100 placeholder-stone-500 focus:outline-none focus:ring-1 focus:ring-orange-500/60"
                                 rows={2}
                                 autoFocus
                               />
@@ -269,7 +268,7 @@ export default function MemoryPanel({ isOpen, onClose }: MemoryPanelProps) {
                                   onChange={(e) =>
                                     setEditCategory(e.target.value as MemoryCategory)
                                   }
-                                  className="text-xs px-2 py-1 bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-600 rounded text-zinc-700 dark:text-zinc-300"
+                                  className="rounded-lg border border-white/10 bg-black/30 px-2 py-1 text-xs text-stone-300 focus:outline-none focus:ring-1 focus:ring-orange-500/60"
                                 >
                                   {CATEGORIES.map((c) => (
                                     <option key={c} value={c}>
@@ -280,13 +279,13 @@ export default function MemoryPanel({ isOpen, onClose }: MemoryPanelProps) {
                                 <div className="flex-1" />
                                 <button
                                   onClick={() => handleEditSave(memory.id)}
-                                  className="text-xs text-green-600 hover:text-green-700 dark:text-green-400 dark:hover:text-green-300 font-medium"
+                                  className="text-xs font-medium text-orange-300 transition-colors hover:text-orange-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70"
                                 >
                                   Save
                                 </button>
                                 <button
                                   onClick={handleEditCancel}
-                                  className="text-xs text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                                  className="text-xs text-stone-400 transition-colors hover:text-stone-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70"
                                 >
                                   Cancel
                                 </button>
@@ -295,23 +294,23 @@ export default function MemoryPanel({ isOpen, onClose }: MemoryPanelProps) {
                           ) : (
                             /* View mode */
                             <>
-                              <p className="text-sm text-zinc-800 dark:text-zinc-200 pr-10">
+                              <p className="text-sm text-stone-100">
                                 {memory.content}
                               </p>
-                              <div className="flex items-center justify-between mt-2">
-                                <span className="text-xs text-zinc-400 dark:text-zinc-500">
+                              <div className="mt-2 flex items-center justify-between">
+                                <span className="text-xs text-stone-500">
                                   {new Date(memory.createdAt).toLocaleDateString()}
                                 </span>
-                                <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <div className="flex items-center gap-2 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
                                   <button
                                     onClick={() => handleEditStart(memory)}
-                                    className="text-xs text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
+                                    className="text-xs text-orange-300 transition-colors hover:text-orange-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70"
                                   >
                                     Edit
                                   </button>
                                   <button
                                     onClick={() => handleDelete(memory.id)}
-                                    className="text-xs text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
+                                    className="text-xs text-red-300 transition-colors hover:text-red-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70"
                                   >
                                     Delete
                                   </button>
@@ -331,10 +330,10 @@ export default function MemoryPanel({ isOpen, onClose }: MemoryPanelProps) {
 
         {/* Footer */}
         {memories.length > 0 && (
-          <div className="p-4 border-t border-zinc-200 dark:border-zinc-700">
+          <div className="border-t border-white/10 p-4">
             <button
               onClick={handleClearAll}
-              className="w-full px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-800 transition-colors"
+              className="w-full rounded-xl border border-red-500/30 px-3 py-2 text-sm text-red-300 transition-colors hover:bg-red-500/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70"
             >
               Clear All Memories
             </button>

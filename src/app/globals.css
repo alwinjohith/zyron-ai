@@ -1,33 +1,88 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  color-scheme: dark;
+  --background: #0b0608;
+  --foreground: #f5efe9;
+  --ember: #ff7a1a;
+  --ember-red: #c2410c;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-ember: var(--ember);
+  --color-ember-red: var(--ember-red);
+  --font-sans: var(--font-manrope);
+  --font-mono: var(--font-manrope);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
+/* Fixed ember atmosphere: orange bloom -> deep red glow -> black base */
 body {
-  background: var(--background);
+  min-height: 100vh;
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans);
+  background-color: var(--background);
+  background-image:
+    radial-gradient(68rem 34rem at 8% -10%, rgb(255 122 26 / 0.22), transparent 60%),
+    radial-gradient(52rem 30rem at 100% 0%, rgb(127 29 29 / 0.3), transparent 62%),
+    radial-gradient(46rem 32rem at 50% 118%, rgb(194 65 12 / 0.16), transparent 62%);
+  background-attachment: fixed;
+}
+
+/* Frosted glass surface for Zyron's chat bubbles and cards */
+@utility glass {
+  background: rgb(255 255 255 / 0.04);
+  border: 1px solid rgb(255 255 255 / 0.1);
+  backdrop-filter: blur(14px);
+}
+
+/* Soft orange glow used behind the brand mark and primary actions */
+@utility ember-glow {
+  box-shadow: 0 0 22px rgb(255 122 26 / 0.35);
+}
+
+/* Signature orange -> red gradient text for the Zyron wordmark */
+@utility text-ember-gradient {
+  background-image: linear-gradient(120deg, #ffa552, #ff7a1a 45%, #e11d48);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
 
 /* Smooth scrolling for the chat area */
 html {
   scroll-behavior: smooth;
+}
+
+/* Slim dark scrollbars to match the ember theme */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(255 255 255 / 0.12);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(255 122 26 / 0.5);
+}
+
+/* Subtle entrance for chat messages and panels */
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* Typing animation for the loading dots */

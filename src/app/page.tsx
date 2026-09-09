@@ -118,30 +118,32 @@ export default function ChatPage() {
     }
   }
 
+  // Fill the composer with a suggested prompt
+  function fillSuggestion(text: string) {
+    setInput(text);
+    inputRef.current?.focus();
+  }
+
   return (
-    <div className="flex flex-col h-screen bg-white dark:bg-zinc-950">
+    <div className="flex h-screen flex-col">
       {/* Header */}
-      <header className="border-b border-zinc-200 dark:border-zinc-800 px-4 py-3">
-        <div className="max-w-2xl mx-auto flex items-center justify-between">
+      <header className="border-b border-white/10 bg-black/30 px-4 py-3 backdrop-blur-xl">
+        <div className="mx-auto flex max-w-2xl items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-white text-lg">
+            <div className="ember-glow flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br from-orange-400 via-orange-600 to-red-700 text-base ring-1 ring-white/20">
               🐉
             </div>
             <div>
-              <h1 className="font-semibold text-zinc-900 dark:text-zinc-100">
-                Zyron
-              </h1>
-              <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                Your Personal AI
-              </p>
+              <h1 className="font-bold text-stone-50">Zyron</h1>
+              <p className="text-xs text-stone-400">Your Personal AI</p>
             </div>
           </div>
           <button
             onClick={() => setIsMemoryOpen(true)}
-            className="flex items-center gap-2 px-3 py-2 text-sm text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg transition-colors"
+            className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3.5 py-2 text-sm text-stone-200 transition-colors hover:border-orange-500/40 hover:bg-white/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70"
             title="View memories"
           >
-            <span className="text-lg">🧠</span>
+            <span className="text-base">🧠</span>
             <span className="hidden sm:inline">Memory</span>
           </button>
         </div>
@@ -149,21 +151,33 @@ export default function ChatPage() {
 
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto">
-        <div className="max-w-2xl mx-auto px-4 py-6">
+        <div className="mx-auto max-w-2xl px-4 py-6">
           {messages.length === 0 && !streamingText && (
-            <div className="text-center py-16">
-              <div className="w-16 h-16 rounded-full bg-blue-600 flex items-center justify-center text-white text-3xl mx-auto mb-4">
+            <div className="py-16 text-center">
+              <div className="ember-glow mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-full bg-gradient-to-br from-orange-400 via-orange-600 to-red-700 text-4xl ring-4 ring-white/10">
                 🐉
               </div>
-              <h2 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100 mb-2">
-                Hello! I&apos;m Zyron
+              <h2 className="mb-3 text-3xl font-bold tracking-tight text-stone-100 sm:text-4xl">
+                Hello! I&apos;m <span className="text-ember-gradient">Zyron</span>
               </h2>
-              <p className="text-zinc-500 dark:text-zinc-400 mb-4">
+              <p className="mb-7 text-stone-400">
                 Your personal AI friend. Ask me anything!
               </p>
-              <div className="text-sm text-zinc-400 dark:text-zinc-500 space-y-1">
-                <p>Try saying: &quot;Remember that I&apos;m an ECE student.&quot;</p>
-                <p>Or ask: &quot;What do you remember about me?&quot;</p>
+              <div className="flex flex-col items-center justify-center gap-2 sm:flex-row">
+                <button
+                  type="button"
+                  onClick={() => fillSuggestion("Remember that I'm an ECE student.")}
+                  className="w-full max-w-xs rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-stone-300 transition-colors hover:border-orange-500/40 hover:text-stone-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70 sm:w-auto"
+                >
+                  Remember that I&apos;m an ECE student
+                </button>
+                <button
+                  type="button"
+                  onClick={() => fillSuggestion("What do you remember about me?")}
+                  className="w-full max-w-xs rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-stone-300 transition-colors hover:border-orange-500/40 hover:text-stone-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70 sm:w-auto"
+                >
+                  What do you remember about me?
+                </button>
               </div>
             </div>
           )}
@@ -174,12 +188,15 @@ export default function ChatPage() {
 
           {/* Streaming response - show text as it arrives */}
           {streamingText && (
-            <div className="flex justify-start mb-4">
-              <div className="bg-zinc-100 dark:bg-zinc-800 rounded-2xl rounded-bl-md px-4 py-3 max-w-[80%]">
-                <div className="text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1">
+            <div className="mb-4 flex items-start justify-start gap-3">
+              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-orange-400 via-orange-600 to-red-700 text-xs ring-1 ring-white/20">
+                🐉
+              </div>
+              <div className="glass max-w-[80%] rounded-2xl rounded-bl-md px-4 py-3">
+                <div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-orange-200/80">
                   Zyron
                 </div>
-                <div className="text-sm leading-relaxed text-zinc-800 dark:text-zinc-200 whitespace-pre-wrap">
+                <div className="whitespace-pre-wrap text-sm leading-relaxed text-stone-100">
                   {streamingText}
                 </div>
               </div>
@@ -188,15 +205,18 @@ export default function ChatPage() {
 
           {/* Loading indicator (only shown before streaming starts) */}
           {isLoading && !streamingText && (
-            <div className="flex justify-start mb-4">
-              <div className="bg-zinc-100 dark:bg-zinc-800 rounded-2xl rounded-bl-md px-4 py-3">
-                <div className="text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1">
+            <div className="mb-4 flex items-start justify-start gap-3">
+              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-orange-400 via-orange-600 to-red-700 text-xs ring-1 ring-white/20">
+                🐉
+              </div>
+              <div className="glass rounded-2xl rounded-bl-md px-4 py-3">
+                <div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-orange-200/80">
                   Zyron
                 </div>
                 <div className="flex gap-1">
-                  <span className="w-2 h-2 bg-zinc-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
-                  <span className="w-2 h-2 bg-zinc-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
-                  <span className="w-2 h-2 bg-zinc-400 rounded-full animate-bounce" />
+                  <span className="h-2 w-2 rounded-full bg-orange-500 animate-bounce [animation-delay:-0.3s]" />
+                  <span className="h-2 w-2 rounded-full bg-orange-500 animate-bounce [animation-delay:-0.15s]" />
+                  <span className="h-2 w-2 rounded-full bg-orange-500 animate-bounce" />
                 </div>
               </div>
             </div>
@@ -207,10 +227,10 @@ export default function ChatPage() {
       </div>
 
       {/* Input area */}
-      <div className="border-t border-zinc-200 dark:border-zinc-800 px-4 py-3">
+      <div className="border-t border-white/10 bg-black/30 px-4 py-3 backdrop-blur-xl">
         <form
           onSubmit={handleSubmit}
-          className="max-w-2xl mx-auto flex gap-2"
+          className="mx-auto flex max-w-2xl gap-2"
         >
           <input
             ref={inputRef}
@@ -219,12 +239,12 @@ export default function ChatPage() {
             onChange={(e) => setInput(e.target.value)}
             placeholder="Type your message..."
             disabled={isLoading}
-            className="flex-1 px-4 py-3 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 text-sm"
+            className="flex-1 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-stone-100 placeholder-stone-500 focus:border-orange-500/40 focus:outline-none focus:ring-2 focus:ring-orange-500/60 disabled:opacity-50"
           />
           <button
             type="submit"
             disabled={isLoading || !input.trim()}
-            className="px-6 py-3 rounded-xl bg-blue-600 text-white font-medium hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm"
+            className="rounded-2xl bg-gradient-to-r from-orange-500 to-red-600 px-6 py-3 text-sm font-medium text-white transition hover:brightness-110 active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-orange-500/70 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {isLoading ? "Sending..." : "Send"}
           </button>

@@ -4,27 +4,33 @@ import type { Message } from "@/types/chat";
 export default function ChatMessage({ message }: { message: Message }) {
   const isUser = message.role === "user";
 
-  return (
-    <div className={`flex ${isUser ? "justify-end" : "justify-start"} mb-4`}>
-      <div
-        className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
-          isUser
-            ? "bg-blue-600 text-white rounded-br-md"
-            : "bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100 rounded-bl-md"
-        }`}
-      >
-        {/* Show label above the message */}
-        <div
-          className={`text-xs font-medium mb-1 ${
-            isUser
-              ? "text-blue-200"
-              : "text-zinc-500 dark:text-zinc-400"
-          }`}
-        >
-          {isUser ? "You" : "Zyron"}
+  if (isUser) {
+    return (
+      <div className="mb-4 flex justify-end animate-[fade-up_0.3s_ease-out]">
+        <div className="max-w-[80%]">
+          <div className="mb-1 text-right text-[10px] font-semibold uppercase tracking-widest text-orange-200/70">
+            You
+          </div>
+          <div className="ember-glow rounded-2xl rounded-br-md border border-white/10 bg-gradient-to-br from-orange-500/90 to-red-700/90 px-4 py-3 text-sm leading-relaxed text-white">
+            <div className="whitespace-pre-wrap">{message.content}</div>
+          </div>
         </div>
-        {/* The actual message content */}
-        <div className="whitespace-pre-wrap">{message.content}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-4 flex items-start justify-start gap-3 animate-[fade-up_0.3s_ease-out]">
+      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-orange-400 via-orange-600 to-red-700 text-xs ring-1 ring-white/20">
+        🐉
+      </div>
+      <div className="max-w-[80%]">
+        <div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-orange-200/80">
+          Zyron
+        </div>
+        <div className="glass rounded-2xl rounded-bl-md px-4 py-3 text-sm leading-relaxed text-stone-100">
+          <div className="whitespace-pre-wrap">{message.content}</div>
+        </div>
       </div>
     </div>
   );
