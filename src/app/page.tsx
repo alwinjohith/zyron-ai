@@ -5,6 +5,7 @@ import ChatMessage from "@/components/ChatMessage";
 import MemoryPanel from "@/components/MemoryPanel";
 import type { Message } from "@/types/chat";
 import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
+import { useSpeechSynthesis } from "@/hooks/useSpeechSynthesis";
 
 // Generate a unique ID for each message
 function generateId(): string {
@@ -32,6 +33,8 @@ export default function ChatPage() {
     stop: stopVoiceRecognition,
     reset: resetVoiceRecognition,
   } = useSpeechRecognition();
+
+  const { speak } = useSpeechSynthesis();
 
   // Text that was already in the composer when listening started, plus a
   // transient user-friendly voice error (auto-dismissed after a few seconds).
@@ -134,6 +137,7 @@ export default function ChatPage() {
           content: fullText,
         };
         setMessages((prev) => [...prev, aiMessage]);
+        speak(fullText);
         setStreamingText("");
       } else {
         // Handle JSON response (memory commands)
@@ -144,6 +148,7 @@ export default function ChatPage() {
           content: data.message,
         };
         setMessages((prev) => [...prev, aiMessage]);
+        speak(data.message);
       }
     } catch (error) {
       const errorMessage: Message = {

@@ -34,6 +34,31 @@ class MockSpeechRecognition {
   }
 }
 
+class MockUtterance {
+  static all: MockUtterance[] = [];
+
+  lang = "";
+  text: string;
+  onstart: (() => void) | null = null;
+  onend: (() => void) | null = null;
+  onerror: ((event: { error: string }) => void) | null = null;
+
+  constructor(text: string) {
+    this.text = text;
+    MockUtterance.all.push(this);
+  }
+}
+
+interface MockSpeechSynth {
+  speaking: boolean;
+  paused: boolean;
+  speak: ReturnType<typeof vi.fn>;
+  cancel: ReturnType<typeof vi.fn>;
+  resume: ReturnType<typeof vi.fn>;
+}
+
+let speechSynth: MockSpeechSynth;
+
 interface ResultItem {
   transcript: string;
   isFinal: boolean;
@@ -52,6 +77,20 @@ function ollamaResponse(content: string): Response {
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       controller.enqueue(encoder.encode(content));
+      controller.close();
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
+}
+
+function streamingResponse(chunks: string[]): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      chunks.forEach((chunk) => controller.enqueue(encoder.encode(chunk)));
       controller.close();
     },
   });
@@ -344,5 +383,156 @@ describe("ChatPage composer — text chat regression", () => {
     expect(body.messages.at(-1).content).toBe("hello zyron");
     await act(async () => {});
     expect(container.textContent).toContain("Hey there!");
+  });
+});
+
+describe("ChatPage composer — text-to-speech", () => {
+  beforeEach(() => {
+    MockUtterance.all = [];
+    speechSynth = {
+      speaking: false,
+      paused: false,
+      speak: vi.fn(),
+      cancel: vi.fn(),
+      resume: vi.fn(),
+    };
+    vi.stubGlobal("speechSynthesis", speechSynth);
+    vi.stubGlobal("SpeechSynthesisUtterance", MockUtterance);
+  });
+
+  function spokenTexts(): string[] {
+    return speechSynth.speak.mock.calls.map(
+      (call) => (call[0] as MockUtterance).text
+    );
+  }
+
+  async function sendTypedMessage(text: string) {
+    typeInComposer(text);
+    await act(async () => {
+      sendBtn().click();
+    });
+    // Let the streaming reader and its chunk loop fully resolve.
+    await act(async () => {});
+    await act(async () => {});
+  }
+
+  it("speaks the completed streamed response exactly once", async () => {
+    const fetchMock = vi.fn(async () => streamingResponse(["Hello ", "world!"]));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    await sendTypedMessage("hello zyron");
+
+    expect(speechSynth.speak).toHaveBeenCalledTimes(1);
+    expect(spokenTexts()).toEqual(["Hello world!"]);
+  });
+
+  it("does not speak once per stream chunk", async () => {
+    const fetchMock = vi.fn(async () => streamingResponse(["ch", "un", "ks"]));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    await sendTypedMessage("hello zyron");
+
+    expect(speechSynth.speak).toHaveBeenCalledTimes(1);
+    expect(spokenTexts()).toEqual(["chunks"]);
+    expect(container.textContent).toContain("chunks");
+  });
+
+  it("never speaks the user's message", async () => {
+    const fetchMock = vi.fn(async () => ollamaResponse("Hey there!"));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    await sendTypedMessage("hello zyron");
+
+    expect(spokenTexts()).toEqual(["Hey there!"]);
+    expect(
+      speechSynth.speak.mock.calls.every(
+        (call) => (call[0] as MockUtterance).text !== "hello zyron"
+      )
+    ).toBe(true);
+  });
+
+  it("does not speak an empty streamed response", async () => {
+    const fetchMock = vi.fn(async () => streamingResponse([]));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    await sendTypedMessage("hello zyron");
+
+    expect(speechSynth.speak).not.toHaveBeenCalled();
+    expect(MockUtterance.all).toHaveLength(0);
+  });
+
+  it("speaks the non-streaming JSON assistant response", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ message: "Got it, I've saved that." }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    await sendTypedMessage("remember that I like Java");
+
+    expect(speechSynth.speak).toHaveBeenCalledTimes(1);
+    expect(spokenTexts()).toEqual(["Got it, I've saved that."]);
+  });
+
+  it("never speaks a catch/error response", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ error: "boom" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    await sendTypedMessage("hello zyron");
+
+    expect(speechSynth.speak).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("Sorry, I couldn't connect");
+  });
+
+  it("speaks the response after a voice (mic) submission", async () => {
+    const fetchMock = vi.fn(async () => ollamaResponse("Dragoons it is!"));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    clickMicWhileIdle();
+    const recognition = latestRecognition();
+    fireStart(recognition);
+    fireResult(recognition, [{ transcript: "surprise me", isFinal: true }]);
+
+    await act(async () => {
+      sendBtn().click();
+    });
+    await act(async () => {});
+    await act(async () => {});
+
+    expect(recognition.stopCalls).toBe(1);
+    expect(speechSynth.speak).toHaveBeenCalledTimes(1);
+    expect(spokenTexts()).toEqual(["Dragoons it is!"]);
+  });
+
+  it("cancels the previous utterance before speaking a new response", async () => {
+    const fetchMock = vi.fn(async () => ollamaResponse("dragon fact"));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    await sendTypedMessage("first question");
+    const cancelsAfterFirst = speechSynth.cancel.mock.calls.length;
+    expect(spokenTexts()).toEqual(["dragon fact"]);
+
+    await sendTypedMessage("second question");
+
+    expect(spokenTexts()).toEqual(["dragon fact", "dragon fact"]);
+    expect(MockUtterance.all).toHaveLength(2);
+    expect(speechSynth.cancel.mock.calls.length).toBeGreaterThan(cancelsAfterFirst);
   });
 });
