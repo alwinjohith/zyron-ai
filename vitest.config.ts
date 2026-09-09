@@ -18,6 +18,9 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // The SQLite test DB is a single shared path; run test files
+    // sequentially in one worker so they never interfere.
+    fileParallelism: false,
     env: {
       MEMORY_DB_PATH: testDbPath,
     },

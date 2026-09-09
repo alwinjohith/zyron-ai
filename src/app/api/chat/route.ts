@@ -34,6 +34,7 @@ import type {
   ToneContext,
 } from "@/types/memory";
 import type { ShortTermContext } from "@/lib/db";
+import { buildSystemPrompt } from "@/lib/context";
 
 // Fix categories for any existing memories on startup
 try {
@@ -565,11 +566,19 @@ export async function POST(request: Request) {
       memoryContext.memories
     );
 
+    const systemContent = buildSystemPrompt(SYSTEM_PROMPT, {
+      memory: memoryPromptSection,
+      shortTerm: shortTermSection,
+      tone: toneSection,
+      project: projectSection,
+      task: taskSection,
+      preferences: preferenceSection,
+    });
+
     const ollamaMessages = [
       {
         role: "system",
-          content:
-          SYSTEM_PROMPT + memoryPromptSection + shortTermSection + toneSection + projectSection + taskSection + preferenceSection,
+        content: systemContent,
       },
       ...messages.map((m: { role: string; content: string }) => ({
         role: m.role,
