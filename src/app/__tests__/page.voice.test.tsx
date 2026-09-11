@@ -536,3 +536,197 @@ describe("ChatPage composer — text-to-speech", () => {
     expect(speechSynth.cancel.mock.calls.length).toBeGreaterThan(cancelsAfterFirst);
   });
 });
+
+describe("ChatPage composer — Stage 4 speaking UX", () => {
+  beforeEach(() => {
+    MockUtterance.all = [];
+    speechSynth = {
+      speaking: false,
+      paused: false,
+      speak: vi.fn(),
+      cancel: vi.fn(),
+      resume: vi.fn(),
+    };
+    vi.stubGlobal("speechSynthesis", speechSynth);
+    vi.stubGlobal("SpeechSynthesisUtterance", MockUtterance);
+  });
+
+  async function sendAndSpeak(content = "dragon fact") {
+    const fetchMock = vi.fn(async () => ollamaResponse(content));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    typeInComposer("hello zyron");
+    await act(async () => {
+      sendBtn().click();
+    });
+    await act(async () => {});
+    await act(async () => {});
+    return MockUtterance.all.at(-1)!;
+  }
+
+  it("shows a speaking indicator while the utterance is active", async () => {
+    const utterance = await sendAndSpeak();
+    expect(statusTexts().some((t) => t.includes("Speaking"))).toBe(false);
+
+    act(() => {
+      utterance.onstart?.();
+    });
+
+    expect(statusTexts().some((t) => t.includes("Speaking"))).toBe(true);
+  });
+
+  it("hides the speaking indicator when the utterance ends naturally", async () => {
+    const utterance = await sendAndSpeak();
+    act(() => {
+      utterance.onstart?.();
+    });
+    expect(statusTexts().some((t) => t.includes("Speaking"))).toBe(true);
+
+    act(() => {
+      utterance.onend?.();
+    });
+    expect(statusTexts().some((t) => t.includes("Speaking"))).toBe(false);
+  });
+
+  it("stops speaking when the stop control is clicked", async () => {
+    const utterance = await sendAndSpeak();
+    act(() => {
+      utterance.onstart?.();
+    });
+
+    const stopBtn = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Stop speaking"]'
+    );
+    expect(stopBtn).not.toBeNull();
+
+    const cancelsBefore = speechSynth.cancel.mock.calls.length;
+    act(() => {
+      stopBtn!.click();
+    });
+
+    expect(speechSynth.cancel.mock.calls.length).toBeGreaterThan(cancelsBefore);
+    expect(statusTexts().some((t) => t.includes("Speaking"))).toBe(false);
+  });
+
+  it("cancels current speech before starting mic recognition", async () => {
+    const utterance = await sendAndSpeak();
+    act(() => {
+      utterance.onstart?.();
+    });
+
+    const cancelsBefore = speechSynth.cancel.mock.calls.length;
+    act(() => {
+      micIdle()!.click();
+    });
+
+    expect(speechSynth.cancel.mock.calls.length).toBeGreaterThan(cancelsBefore);
+
+    fireStart(latestRecognition());
+    expect(micStop()).not.toBeNull();
+  });
+
+  it("cancels speech when the page becomes hidden", async () => {
+    const utterance = await sendAndSpeak();
+    act(() => {
+      utterance.onstart?.();
+    });
+
+    const cancelsBefore = speechSynth.cancel.mock.calls.length;
+    const originalHidden = document.hidden;
+
+    act(() => {
+      Object.defineProperty(document, "hidden", {
+        configurable: true,
+        value: true,
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    expect(speechSynth.cancel.mock.calls.length).toBeGreaterThan(cancelsBefore);
+    expect(statusTexts().some((t) => t.includes("Speaking"))).toBe(false);
+
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      value: originalHidden,
+    });
+  });
+
+  it("shows a friendly message when speech synthesis fails", async () => {
+    const utterance = await sendAndSpeak();
+    act(() => {
+      utterance.onerror?.({ error: "interrupted" });
+    });
+
+    expect(
+      statusTexts().some((t) =>
+        t.includes("Zyron couldn't speak this response")
+      )
+    ).toBe(true);
+  });
+
+  it("degrades gracefully when speech synthesis is unsupported", async () => {
+    vi.unstubAllGlobals();
+    const fetchMock = vi.fn(async () => ollamaResponse("Still works in text."));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    typeInComposer("hello zyron");
+    await act(async () => {
+      sendBtn().click();
+    });
+    await act(async () => {});
+    await act(async () => {});
+
+    expect(container.textContent).toContain("Still works in text.");
+    expect(
+      statusTexts().some((t) => t.includes("Voice output is unavailable"))
+    ).toBe(true);
+    // No broken speaking control is rendered.
+    expect(
+      container.querySelector('[aria-label="Stop speaking"]')
+    ).toBeNull();
+  });
+
+  it("keeps existing microphone start/stop behavior", () => {
+    renderPage();
+    clickMicWhileIdle();
+    const recognition = latestRecognition();
+    fireStart(recognition);
+    expect(micStop()).not.toBeNull();
+
+    act(() => {
+      micStop()!.click();
+    });
+    expect(recognition.stopCalls).toBe(1);
+    expect(micIdle()).not.toBeNull();
+  });
+
+  it("keeps existing text-only chat behavior", async () => {
+    const fetchMock = vi.fn(async () => ollamaResponse("Text-only reply"));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    typeInComposer("plain text");
+    await act(async () => {
+      sendBtn().click();
+    });
+    await act(async () => {});
+    await act(async () => {});
+
+    expect(container.textContent).toContain("Text-only reply");
+    expect(speechSynth.speak).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps listening indicators visible with reduced-motion in mind", () => {
+    renderPage();
+    clickMicWhileIdle();
+    fireStart(latestRecognition());
+
+    // The animated decorations remain targets for the reduced-motion override,
+    // while the static status text keeps the state visible for all users.
+    expect(container.querySelector(".animate-ping")).not.toBeNull();
+    expect(container.querySelector(".animate-pulse")).not.toBeNull();
+    expect(statusTexts().some((t) => t.includes("Listening"))).toBe(true);
+  });
+});

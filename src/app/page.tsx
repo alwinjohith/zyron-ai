@@ -12,6 +12,17 @@ function generateId(): string {
   return Math.random().toString(36).substring(2, 9);
 }
 
+// Turn low-level speech-synthesis errors into a short, friendly message.
+function friendlySynthesisMessage(raw: string): string {
+  if (raw.includes("not supported")) {
+    return "Voice output is unavailable in this browser.";
+  }
+  if (raw.includes("internet connection")) {
+    return "Voice output needs an internet connection — your reply is on screen.";
+  }
+  return "Zyron couldn't speak this response.";
+}
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -34,12 +45,20 @@ export default function ChatPage() {
     reset: resetVoiceRecognition,
   } = useSpeechRecognition();
 
-  const { speak } = useSpeechSynthesis();
+  const {
+    isSpeaking,
+    speak,
+    cancel: cancelSpeech,
+    isSupported: isSynthesisSupported,
+    error: synthesisError,
+  } = useSpeechSynthesis();
 
   // Text that was already in the composer when listening started, plus a
   // transient user-friendly voice error (auto-dismissed after a few seconds).
   const [voiceError, setVoiceError] = useState<string | null>(recognitionError);
   const voicePrefixRef = useRef("");
+  // Transient user-friendly speech-synthesis error (auto-dismissed).
+  const [synthesisNotice, setSynthesisNotice] = useState<string | null>(null);
 
   // Scroll to the latest message whenever messages or streaming text changes
   useEffect(() => {
@@ -71,6 +90,32 @@ export default function ChatPage() {
     const timer = setTimeout(() => setVoiceError(null), 5000);
     return () => clearTimeout(timer);
   }, [recognitionError]);
+
+  // Keep the synthesis notice in sync with the latest TTS error, and auto-
+  // dismiss it after a few seconds so it never lingers.
+  if (synthesisError && synthesisNotice !== synthesisError) {
+    setSynthesisNotice(synthesisError);
+  }
+
+  useEffect(() => {
+    if (!synthesisNotice) return;
+    const timer = setTimeout(() => setSynthesisNotice(null), 5000);
+    return () => clearTimeout(timer);
+  }, [synthesisNotice]);
+
+  // Stop Zyron's voice when the page or tab is hidden so it does not keep
+  // talking in the background.
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        cancelSpeech();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [cancelSpeech]);
 
   // Send a message to the AI
   async function handleSubmit(e: FormEvent) {
@@ -174,6 +219,11 @@ export default function ChatPage() {
 
   // Toggle voice recognition from the composer.
   function handleMicClick() {
+    // Never let the microphone capture Zyron's own voice: cancel any active
+    // speech before recognition may start.
+    if (isSpeaking) {
+      cancelSpeech();
+    }
     if (isListening) {
       stopVoiceRecognition();
       return;
@@ -186,6 +236,10 @@ export default function ChatPage() {
     resetVoiceRecognition();
     startVoiceRecognition();
   }
+
+  // The newest assistant reply — the only message that may be spoken.
+  const lastAssistantId =
+    [...messages].reverse().find((m) => m.role === "assistant")?.id ?? null;
 
   return (
     <div className="flex h-screen flex-col">
@@ -246,7 +300,11 @@ export default function ChatPage() {
           )}
 
           {messages.map((message) => (
-            <ChatMessage key={message.id} message={message} />
+            <ChatMessage
+              key={message.id}
+              message={message}
+              isSpeaking={isSpeaking && message.id === lastAssistantId}
+            />
           ))}
 
           {/* Streaming response - show text as it arrives */}
@@ -302,6 +360,37 @@ export default function ChatPage() {
                 <span className="relative inline-flex h-2 w-2 rounded-full bg-orange-500" />
               </span>
               Listening… speak now, then stop
+            </div>
+          )}
+
+          {isSpeaking && isSynthesisSupported && (
+            <div
+              role="status"
+              className="mb-2 flex items-center justify-center gap-2 text-xs font-medium text-orange-300"
+            >
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-orange-400 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-orange-400" />
+              </span>
+              <span>Zyron is speaking…</span>
+              <button
+                type="button"
+                onClick={cancelSpeech}
+                aria-label="Stop speaking"
+                title="Stop speaking"
+                className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-stone-200 transition hover:border-orange-500/40 hover:text-orange-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500/70"
+              >
+                Stop
+              </button>
+            </div>
+          )}
+
+          {synthesisNotice && (
+            <div
+              role="status"
+              className="mb-2 flex items-center justify-center gap-2 text-xs text-amber-300"
+            >
+              <span>{friendlySynthesisMessage(synthesisNotice)}</span>
             </div>
           )}
 
