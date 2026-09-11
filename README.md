@@ -49,6 +49,29 @@ brew services start ollama
 - Generation options: `num_predict=256`, `temperature=0.3`, `top_p=0.9`
 - Reasoning: disabled (`think: false`) for fast CPU responses
 
+## Local Speech-to-Text (Whisper)
+
+For browsers without the Web Speech API (such as Firefox), Zyron records with
+`MediaRecorder` and sends the clip to a local Whisper server through `/api/stt`.
+
+- Whisper server URL: `http://127.0.0.1:8080` (override via `WHISPER_SERVER_URL`
+  in `.env.local`)
+
+The local whisper-server must be running separately, e.g.:
+
+```bash
+~/whisper.cpp/build/bin/whisper-server \
+  -m /home/megas/whisper.cpp/models/ggml-base.en.bin \
+  -t 8 \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --convert \
+  --tmp-dir /tmp
+```
+
+The `--convert` flag (which requires `ffmpeg`) lets whisper-server accept the
+Opus/Ogg audio Firefox records directly.
+
 ### Files in this repository
 
 - `Modelfile` — Documents the model configuration for reproducibility

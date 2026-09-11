@@ -5,6 +5,7 @@ import ChatMessage from "@/components/ChatMessage";
 import MemoryPanel from "@/components/MemoryPanel";
 import type { Message } from "@/types/chat";
 import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
+import { useWhisperRecognition } from "@/hooks/useWhisperRecognition";
 import { useSpeechSynthesis } from "@/hooks/useSpeechSynthesis";
 
 // Generate a unique ID for each message
@@ -33,7 +34,14 @@ export default function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Voice input — browser-native speech recognition wired to the composer.
+  // Voice input — browser-native speech recognition when available, falling
+  // back to local Whisper (e.g. Firefox, which has no Web Speech API).
+  const speechRecognition = useSpeechRecognition();
+  const whisperRecognition = useWhisperRecognition();
+
+  const isLocalWhisper =
+    !speechRecognition.isSupported && whisperRecognition.isSupported;
+
   const {
     isSupported: isRecognitionSupported,
     isListening,
@@ -43,7 +51,9 @@ export default function ChatPage() {
     start: startVoiceRecognition,
     stop: stopVoiceRecognition,
     reset: resetVoiceRecognition,
-  } = useSpeechRecognition();
+  } = isLocalWhisper ? whisperRecognition : speechRecognition;
+
+  const isWhisperProcessing = whisperRecognition.isProcessing;
 
   const {
     isSpeaking,
@@ -57,6 +67,8 @@ export default function ChatPage() {
   // transient user-friendly voice error (auto-dismissed after a few seconds).
   const [voiceError, setVoiceError] = useState<string | null>(recognitionError);
   const voicePrefixRef = useRef("");
+  // Tracks the last Whisper draft applied so re-renders never duplicate it.
+  const whisperDraftRef = useRef("");
   // Transient user-friendly speech-synthesis error (auto-dismissed).
   const [synthesisNotice, setSynthesisNotice] = useState<string | null>(null);
 
@@ -77,6 +89,18 @@ export default function ChatPage() {
     const prefix = voicePrefixRef.current.trim();
     setInput(prefix ? (voice ? `${prefix} ${voice}` : prefix) : voice);
   }, [isListening, transcript, interimTranscript]);
+
+  // Local Whisper does not stream: the transcript arrives after recording
+  // stops. Once it lands (and we are no longer listening), fill the composer
+  // the same way the browser-native flow does while preserving typed text.
+  useEffect(() => {
+    if (!isLocalWhisper || isListening) return;
+    const voice = transcript.trim();
+    if (!voice || whisperDraftRef.current === voice) return;
+    whisperDraftRef.current = voice;
+    const prefix = voicePrefixRef.current.trim();
+    setInput(prefix ? `${prefix} ${voice}` : voice);
+  }, [isLocalWhisper, isListening, transcript]);
 
   // Keep the displayed voice error in sync with the latest recognition error
   // (guarded state adjustment during render — the documented React pattern).
@@ -232,6 +256,7 @@ export default function ChatPage() {
     // Remember what the user typed so the voice draft appends to it, and
     // clear any previous voice error before starting a fresh session.
     voicePrefixRef.current = input;
+    whisperDraftRef.current = "";
     setVoiceError(null);
     resetVoiceRecognition();
     startVoiceRecognition();
@@ -360,6 +385,19 @@ export default function ChatPage() {
                 <span className="relative inline-flex h-2 w-2 rounded-full bg-orange-500" />
               </span>
               Listening… speak now, then stop
+            </div>
+          )}
+
+          {isLocalWhisper && isWhisperProcessing && (
+            <div
+              role="status"
+              className="mb-2 flex items-center justify-center gap-2 text-xs font-medium text-orange-300"
+            >
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-orange-500 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-orange-500" />
+              </span>
+              Transcribing…
             </div>
           )}
 
